@@ -74,6 +74,29 @@ def _prepared(state: Path, image, retry_job: str):
 
 
 @pytest.mark.parametrize("dry_run", [False, True])
+def test_retry_refuses_captured_boot_start_hooks_before_touching_backup_or_callbacks(
+    retry_job: tuple[Menu, Path], monkeypatch: pytest.MonkeyPatch, dry_run: bool
+) -> None:
+    menu, callbacks = retry_job
+    state = menu.job_state(JOB)
+    (state / "profile.toml").write_text(
+        "[[hooks]]\nphase = 'post'\nkey = 'Services\\USBXHCI'\nname = 'start'\nvalue = 0\n",
+        encoding="ascii",
+    )
+    monkeypatch.setattr(
+        feature_upgrade,
+        "check_feature_retry",
+        lambda *args, **kwargs: pytest.fail("Started native retry validation"),
+    )
+    with pytest.raises(ValueError, match="boot-start driver hooks"):
+        menu.retry_feature(dry_run=dry_run)
+
+    assert (state / "rollback.json").is_file()
+    assert (state / "claimed.id").is_file()
+    assert (callbacks / OLD / "precommit.cmd").is_file()
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
 def test_retry_keeps_the_same_backup_and_moves_only_archived_callbacks(
     retry_job: tuple[Menu, Path], monkeypatch: pytest.MonkeyPatch, dry_run: bool
 ) -> None:

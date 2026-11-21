@@ -230,6 +230,51 @@ def test_feature_is_published_only_after_backup_and_deferred_setup(
         )[0]
 
 
+@pytest.mark.parametrize(
+    ("scope", "key"),
+    [
+        ("control-set", r"Services\Usb4HostRouter"),
+        ("system", r"ControlSet001\Services\Usb4HostRouter"),
+    ],
+)
+def test_full_iso_feature_stage_refuses_boot_start_hooks_before_changing_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scope: str, key: str
+) -> None:
+    from wuo import feature_upgrade
+    from wuo.winre_menu import Menu
+
+    identity = TargetIdentity(
+        "25H2", 26200, 9974, "x64", tmp_path / "Windows", OWNER, LOADER
+    )
+    menu = Menu(identity)
+    menu.root.mkdir(parents=True)
+    (menu.root / "installed.id").write_text(f"{OWNER}\n", encoding="ascii")
+    (menu.root / "feature-menu.version").write_bytes(b"2\r\n")
+    menu.job_state(JOB).parent.mkdir()
+    profile = tmp_path / "external.toml"
+    profile.write_text(
+        f"[[hooks]]\nphase = 'post'\nscope = '{scope}'\nkey = '{key}'\nname = 'Start'\nvalue = 0\n",
+        encoding="ascii",
+    )
+    iso = tmp_path / "Windows.iso"
+    iso.touch()
+    media = feature_upgrade.FeatureMedia(
+        iso, "ab" * 32, rollback=True, preserve_boot_order=True
+    )
+    image = feature_upgrade.FeatureImage(1, 26300, 9457, "Core", "x64", "en-US")
+    monkeypatch.setattr(menu, "_require_windows_complete_locked", lambda: None)
+    monkeypatch.setattr("wuo.target.read_target", lambda: identity)
+    monkeypatch.setattr(
+        "wuo.winre_menu._run", lambda _: pytest.fail("Changed feature job state")
+    )
+
+    with pytest.raises(ValueError, match="boot-start driver hooks"):
+        menu.stage_feature(media, image, profile, backup_drive="F:")
+
+    assert not (menu.root / "pending.id").exists()
+    assert not any(menu.root.parent.glob("jobs/*"))
+
+
 def test_resume_requires_boot_preservation_in_the_captured_feature_job(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -251,6 +296,14 @@ def test_resume_requires_boot_preservation_in_the_captured_feature_job(
 
     with pytest.raises(ValueError, match="staged without boot preservation"):
         menu.resume(require_boot_preservation=True)
+
+    (state / "profile.toml").write_text(
+        "[[hooks]]\nphase = 'post'\nkey = 'Services\\AnotherDriver'\nname = 'Start'\nvalue = 0\n",
+        encoding="ascii",
+    )
+    with pytest.raises(ValueError, match="boot-start driver hooks"):
+        menu.resume()
+    assert (menu.root / "pending.id").read_text().strip() == JOB
 
 
 def test_feature_verification_waits_for_boot_preservation_receipt(

@@ -5,6 +5,16 @@ ISO and continue it from **Troubleshoot → wuo** in the installed Windows
 Recovery Environment (WinRE). The full upgrade and recovery paths have been
 rehearsed in a split-EFI VM. Physical Limine setups still require validation.
 
+The `wuo` CLI blocks staging, offering a restart, and retrying a full ISO
+job whose profile sets a driver's `Start` to `0` in a post hook. This
+includes `official/usb4`. Windows Setup can continue past SafeOS without
+a final check of the drivers needed to boot the replacement installation.
+`wuo retry-feature --dry-run` reports this block before checking the
+backup. ISO compatibility previews still check the media. Keep your boot
+hooks enabled for cumulative updates, drivers, and enablement packages.
+An already installed WinRE menu can still authorize a job staged by an
+earlier release. Leave such a job unapproved and retain its recovery files.
+
 ## Compatibility preview
 
 The normal `wuo update` scan includes feature upgrades. Use

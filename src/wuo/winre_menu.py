@@ -16,6 +16,7 @@ from xml.sax.saxutils import escape
 
 from . import bundle
 from .downloads import package_hashes
+from .hooks import require_full_upgrade_hook_support
 from .target import TargetIdentity
 lazy from . import windows_updates
 lazy from .feature_upgrade import FeatureImage, FeatureMedia
@@ -193,11 +194,12 @@ class Menu:
                 raise ValueError(
                     "Refresh the recovery menu with wuo remove and wuo setup before preparing a feature upgrade."
                 )
+            selected = read_selection(profile)
+            require_full_upgrade_hook_support(selected.hooks)
             if read_target() != self.target:
                 raise ValueError(
                     "The running Windows identity changed before preparation."
                 )
-            selected = read_selection(profile)
             media = replace(media, iso=media.iso.resolve(strict=True))
             job_id = uuid4()
             job = self.job_state(str(job_id))
@@ -643,6 +645,10 @@ class Menu:
                 raise ValueError(
                     "This retry supports jobs with post-update hooks only."
                 )
+            profile = state / "profile.toml"
+            require_full_upgrade_hook_support(
+                read_selection(profile if profile.is_file() else None).hooks
+            )
             attempt = state / "retry-active"
             if attempt.resolve() != attempt or (
                 attempt.exists() and not attempt.is_dir()
@@ -843,20 +849,25 @@ class Menu:
                 (self.root / "pending.id").unlink()
                 return True
             state = self.job_state(job_id)
-            if require_boot_preservation and (state / "feature.ready").is_file():
-                request = json.loads((state / "feature.json").read_bytes())
-                if not request.get("boot_preservation"):
-                    raise ValueError(
-                        "This feature upgrade was staged without boot preservation. "
-                        "Keep the staged job and its backup. Run wuo status to review it."
+            if (state / "feature.ready").is_file():
+                if require_boot_preservation:
+                    request = json.loads((state / "feature.json").read_bytes())
+                    if not request.get("boot_preservation"):
+                        raise ValueError(
+                            "This feature upgrade was staged without boot preservation. "
+                            "Keep the staged job and its backup. Run wuo status to review it."
+                        )
+                if any(
+                    (state / name).is_file() for name in ("authorized.id", "claimed.id")
+                ):
+                    print(
+                        "The feature upgrade has already been authorized. Run wuo status."
                     )
-            if (state / "feature.ready").is_file() and any(
-                (state / name).is_file() for name in ("authorized.id", "claimed.id")
-            ):
-                print(
-                    "The feature upgrade has already been authorized. Run wuo status."
+                    return False
+                profile = state / "profile.toml"
+                require_full_upgrade_hook_support(
+                    read_selection(profile if profile.is_file() else None).hooks
                 )
-                return False
             if (state / "apply.started").exists():
                 raise ValueError(
                     f"Offline servicing was interrupted. See {state / 'recovery.log'}."
