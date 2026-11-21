@@ -17,6 +17,7 @@ lazy from . import bundle, catalog, downloads, feeds, target
 lazy from .feature_upgrade import FeatureMedia
 lazy from .hook_registry import HookRegistry
 lazy from .hook_selection import describe_selection, read_selection, resolve_selection
+lazy from .hooks import require_full_upgrade_hook_support
 lazy from .update import PreparedUpdates, run_update
 lazy from .winre_menu import Menu
 
@@ -184,6 +185,7 @@ async def _stage_update(
                     "Resolve the other update failures before preparing the full feature upgrade."
                 )
                 return result
+            require_full_upgrade_hook_support(read_selection(profile).hooks)
             current = await asyncio.to_thread(target.read_target)
             if replace(current, loader_guid=identity.loader_guid) != identity:
                 raise ValueError("The running Windows build changed during the scan.")

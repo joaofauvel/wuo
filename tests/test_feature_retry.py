@@ -74,13 +74,13 @@ def _prepared(state: Path, image, retry_job: str):
 
 
 @pytest.mark.parametrize("dry_run", [False, True])
-def test_retry_refuses_captured_boot_start_hooks_before_touching_backup_or_callbacks(
+def test_retry_refuses_captured_post_hooks_before_touching_backup_or_callbacks(
     retry_job: tuple[Menu, Path], monkeypatch: pytest.MonkeyPatch, dry_run: bool
 ) -> None:
     menu, callbacks = retry_job
     state = menu.job_state(JOB)
     (state / "profile.toml").write_text(
-        "[[hooks]]\nphase = 'post'\nkey = 'Services\\USBXHCI'\nname = 'start'\nvalue = 0\n",
+        "[[hooks]]\nphase = 'post'\nkey = 'Control'\nname = 'BootDriverFlags'\nvalue = 28\n",
         encoding="ascii",
     )
     monkeypatch.setattr(
@@ -88,7 +88,7 @@ def test_retry_refuses_captured_boot_start_hooks_before_touching_backup_or_callb
         "check_feature_retry",
         lambda *args, **kwargs: pytest.fail("Started native retry validation"),
     )
-    with pytest.raises(ValueError, match="boot-start driver hooks"):
+    with pytest.raises(ValueError, match="after SafeOS"):
         menu.retry_feature(dry_run=dry_run)
 
     assert (state / "rollback.json").is_file()

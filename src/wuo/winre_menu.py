@@ -52,6 +52,14 @@ def _read_id(path: Path) -> str | None:
     return _id(value.removesuffix("\n"))
 
 
+def _require_captured_feature_hook_support(state: Path) -> None:
+    profile = state / "profile.toml"
+    if profile.is_file():
+        require_full_upgrade_hook_support(read_selection(profile).hooks)
+    elif profile.exists() or (state / "hooks.json").exists():
+        raise ValueError("The captured feature hook profile is missing or invalid.")
+
+
 def _check_callback(path: Path, digest: str) -> None:
     for entry in (path.parent, path):
         attributes = getattr(entry.lstat(), "st_file_attributes", 0)
@@ -587,19 +595,36 @@ class Menu:
                     print(
                         f"Windows Setup started the feature upgrade. Review {state / 'precommit.log'}."
                     )
-                elif (state / "authorized.id").is_file():
+                else:
+                    authorized = (state / "authorized.id").is_file()
                     backup_check = state / "backup-check.log"
-                    if backup_check.is_file():
-                        print(
-                            "Windows paused Setup because it could not verify the rollback backup. "
-                            f"Reconnect the backup drive and restart Windows. See {backup_check}."
-                        )
+                    try:
+                        _require_captured_feature_hook_support(state)
+                    except ValueError as exc:
+                        print(str(exc))
+                        if authorized:
+                            print(
+                                "WinRE already authorized this job. The saved startup task can still resume it."
+                            )
+                            if backup_check.is_file():
+                                print(f"Backup check log: {backup_check}")
+                        else:
+                            print("Leave this staged job unapproved in WinRE.")
+                        return
+                    if authorized:
+                        if backup_check.is_file():
+                            print(
+                                "Windows paused Setup because it could not verify the rollback backup. "
+                                f"Reconnect the backup drive and restart Windows. See {backup_check}."
+                            )
+                        else:
+                            print(
+                                "WinRE authorized the feature upgrade. Windows will resume the staged job."
+                            )
                     else:
                         print(
-                            "WinRE authorized the feature upgrade. Windows will resume the staged job."
+                            "Feature upgrade staged. Run wuo update to enter recovery."
                         )
-                else:
-                    print("Feature upgrade staged. Run wuo update to enter recovery.")
                 return
             if (state / "apply.started").exists():
                 raise ValueError(
@@ -642,13 +667,8 @@ class Menu:
                     "The feature job reached a phase that cannot be retried here."
                 )
             if (state / "source-hooks.cmd").exists():
-                raise ValueError(
-                    "This retry supports jobs with post-update hooks only."
-                )
-            profile = state / "profile.toml"
-            require_full_upgrade_hook_support(
-                read_selection(profile if profile.is_file() else None).hooks
-            )
+                raise ValueError("This retry cannot replay source hooks.")
+            _require_captured_feature_hook_support(state)
             attempt = state / "retry-active"
             if attempt.resolve() != attempt or (
                 attempt.exists() and not attempt.is_dir()
@@ -833,10 +853,14 @@ class Menu:
                 raise ValueError(
                     "The unfinished Windows phase has captured hooks. Finish it with a plain wuo update before selecting hooks for a new phase."
                 )
+            job_id = self._pending_id()
             if windows_result is not None and windows_result.reboot_required:
+                if job_id is not None:
+                    state = self.job_state(job_id)
+                    if (state / "feature.ready").is_file():
+                        _require_captured_feature_hook_support(state)
                 print("Restart Windows to finish the Windows phase before continuing.")
                 return False
-            job_id = self._pending_id()
             if job_id is None:
                 return True
             if self.windows_incomplete:
@@ -864,10 +888,7 @@ class Menu:
                         "The feature upgrade has already been authorized. Run wuo status."
                     )
                     return False
-                profile = state / "profile.toml"
-                require_full_upgrade_hook_support(
-                    read_selection(profile if profile.is_file() else None).hooks
-                )
+                _require_captured_feature_hook_support(state)
             if (state / "apply.started").exists():
                 raise ValueError(
                     f"Offline servicing was interrupted. See {state / 'recovery.log'}."

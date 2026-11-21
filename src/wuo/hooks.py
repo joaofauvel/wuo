@@ -18,22 +18,11 @@ class Hook:
 
 
 def require_full_upgrade_hook_support(hooks: tuple[Hook, ...]) -> None:
-    for hook in hooks:
-        service_path = (
-            r"Services\\[^\\]+"
-            if hook.scope == "control-set"
-            else r"ControlSet[0-9]{3}\\Services\\[^\\]+"
+    if any(hook.phase == "post" for hook in hooks):
+        raise ValueError(
+            "Full ISO feature upgrades with post hooks are blocked. "
+            "These hooks need verification after SafeOS and before Windows boots."
         )
-        if (
-            hook.phase == "post"
-            and hook.value == 0
-            and hook.name.casefold() == "start"
-            and re.fullmatch(service_path, hook.key, re.I)
-        ):
-            raise ValueError(
-                "Full ISO feature upgrades with boot-start driver hooks are blocked. "
-                "These settings need verification after SafeOS and before Windows boots."
-            )
 
 
 def load_profile(path: Path) -> tuple[Hook, ...]:

@@ -1,19 +1,25 @@
 # Hooks before the first boot of a feature upgrade
 
-The release candidate can prepare a full Windows Setup upgrade from an
-ISO and continue it from **Troubleshoot → wuo** in the installed Windows
-Recovery Environment (WinRE). The full upgrade and recovery paths have been
-rehearsed in a split-EFI VM. Physical Limine setups still require validation.
+`0.4.1rc4` can check compatibility with an ISO and prepare an eligible
+full Windows Setup upgrade. Eligible jobs continue from **Troubleshoot →
+wuo** in the installed Windows Recovery Environment (WinRE). The native
+upgrade completed in a split-EFI NVMe VM without hooks. Physical USB4 and
+Limine setups still require validation.
 
 The `wuo` CLI blocks staging, offering a restart, and retrying a full ISO
-job whose profile sets a driver's `Start` to `0` in a post hook. This
-includes `official/usb4`. Windows Setup can continue past SafeOS without
-a final check of the drivers needed to boot the replacement installation.
+job with any post hook, including `official/usb4`. These hooks require
+verification after SafeOS and before the replacement Windows installation
+boots. In the VM, the native **Windows Rollback** entry could recreate the
+replacement boot request and restart. The required recovery handoff is
+still under development.
 `wuo retry-feature --dry-run` reports this block before checking the
 backup. ISO compatibility previews still check the media. Keep your boot
 hooks enabled for cumulative updates, drivers, and enablement packages.
-An already installed WinRE menu can still authorize a job staged by an
-earlier release. Leave such a job unapproved and retain its recovery files.
+An earlier WinRE launcher can still authorize a job staged by an earlier
+release. Use `wuo status` to inspect the job from Windows and leave it
+unapproved in WinRE. If that launcher already authorized the job, its saved
+startup task can still continue Setup on a normal reboot. Retain its recovery
+files.
 
 ## Compatibility preview
 
@@ -87,24 +93,17 @@ and identifies entries or files that need manual attention.
 
 ## Retry a precommit failure
 
-If Setup stopped with `0xC19001E3` before the current job ran its precommit
-hooks, `wuo retry-feature` can prepare the same ISO again under the same job ID.
-It reuses that job's rollback image, keeps the captured post-update hooks and EFI files,
-and archives verified callbacks from earlier abandoned jobs.
-
-Use an administrator PowerShell. Keep the ISO and the rollback drive connected.
+Use an administrator PowerShell to review a failed legacy feature job.
 
 ```powershell
-wuo retry-feature --dry-run
-wuo retry-feature
 wuo status
+wuo retry-feature --dry-run
 ```
 
-The dry run checks the job, the running Windows installation, and the backup
-catalog. The retry requires the boot preservation result to be complete. Once
-status reports **Feature upgrade staged**, run `wuo update` to enter recovery
-and select **Troubleshoot → wuo**. The existing backup still represents the
-original snapshot time.
+RC4 reports the block for a captured post hook before checking its rollback
+backup. Leave such a job unapproved and retain its recovery files. For eligible
+jobs without post hooks, the preview checks the current Windows installation
+and the original backup catalog for that job.
 
 ## Preboot hooks
 

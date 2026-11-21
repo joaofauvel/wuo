@@ -1,3 +1,5 @@
+import argparse
+import asyncio
 import json
 import os
 import subprocess
@@ -5,6 +7,7 @@ from pathlib import Path
 from uuid import uuid4
 from xml.etree import ElementTree
 
+import httpx
 import pytest
 
 from wuo import cli
@@ -231,14 +234,21 @@ def test_feature_is_published_only_after_backup_and_deferred_setup(
 
 
 @pytest.mark.parametrize(
-    ("scope", "key"),
+    ("scope", "key", "name", "value"),
     [
-        ("control-set", r"Services\Usb4HostRouter"),
-        ("system", r"ControlSet001\Services\Usb4HostRouter"),
+        ("control-set", r"Services\Usb4HostRouter", "Start", 0),
+        ("system", r"ControlSet001\Services\Usb4HostRouter", "Start", 0),
+        ("control-set", r"Services\stornvme\StartOverride", "0", 0),
+        ("system", r"Software\WUO", "Enabled", 1),
     ],
 )
-def test_full_iso_feature_stage_refuses_boot_start_hooks_before_changing_state(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scope: str, key: str
+def test_full_iso_feature_stage_refuses_post_hooks_before_changing_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scope: str,
+    key: str,
+    name: str,
+    value: int,
 ) -> None:
     from wuo import feature_upgrade
     from wuo.winre_menu import Menu
@@ -253,7 +263,7 @@ def test_full_iso_feature_stage_refuses_boot_start_hooks_before_changing_state(
     menu.job_state(JOB).parent.mkdir()
     profile = tmp_path / "external.toml"
     profile.write_text(
-        f"[[hooks]]\nphase = 'post'\nscope = '{scope}'\nkey = '{key}'\nname = 'Start'\nvalue = 0\n",
+        f"[[hooks]]\nphase = 'post'\nscope = '{scope}'\nkey = '{key}'\nname = '{name}'\nvalue = {value}\n",
         encoding="ascii",
     )
     iso = tmp_path / "Windows.iso"
@@ -268,7 +278,7 @@ def test_full_iso_feature_stage_refuses_boot_start_hooks_before_changing_state(
         "wuo.winre_menu._run", lambda _: pytest.fail("Changed feature job state")
     )
 
-    with pytest.raises(ValueError, match="boot-start driver hooks"):
+    with pytest.raises(ValueError, match="after SafeOS"):
         menu.stage_feature(media, image, profile, backup_drive="F:")
 
     assert not (menu.root / "pending.id").exists()
@@ -276,8 +286,9 @@ def test_full_iso_feature_stage_refuses_boot_start_hooks_before_changing_state(
 
 
 def test_resume_requires_boot_preservation_in_the_captured_feature_job(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    from wuo import windows_updates
     from wuo.winre_menu import Menu
 
     identity = TargetIdentity(
@@ -298,12 +309,87 @@ def test_resume_requires_boot_preservation_in_the_captured_feature_job(
         menu.resume(require_boot_preservation=True)
 
     (state / "profile.toml").write_text(
-        "[[hooks]]\nphase = 'post'\nkey = 'Services\\AnotherDriver'\nname = 'Start'\nvalue = 0\n",
+        "[[hooks]]\nphase = 'post'\nkey = 'Services\\AnotherDriver\\StartOverride'\nname = '0'\nvalue = 0\n",
         encoding="ascii",
     )
-    with pytest.raises(ValueError, match="boot-start driver hooks"):
+    with pytest.raises(ValueError, match="after SafeOS"):
         menu.resume()
     assert (menu.root / "pending.id").read_text().strip() == JOB
+    capsys.readouterr()
+    menu.status()
+    output = capsys.readouterr().out
+    assert "Full ISO feature upgrades with post hooks are blocked" in output
+    assert "Run wuo update to enter recovery" not in output
+
+    (state / "authorized.id").write_text(f"{JOB}\n", encoding="ascii")
+    (state / "backup-check.log").touch()
+    menu.status()
+    output = capsys.readouterr().out
+    assert "The saved startup task can still resume it" in output
+    assert "Reconnect the backup drive and restart" not in output
+
+    monkeypatch.setattr(
+        windows_updates,
+        "verify",
+        lambda *_: windows_updates.WindowsResult(False, True, (), state / "journal"),
+    )
+    with pytest.raises(ValueError, match="after SafeOS"):
+        menu.resume()
+    assert "Restart Windows to finish the Windows phase" not in capsys.readouterr().out
+
+    (state / "profile.toml").unlink()
+    (state / "hooks.json").write_text("{}", encoding="ascii")
+    with pytest.raises(ValueError, match="captured feature hook profile is missing"):
+        menu.resume()
+
+
+def test_feature_cli_blocks_post_hooks_before_offer_to_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from wuo.feature_upgrade import FeatureImage
+    from wuo.update import PreparedUpdates
+    from wuo.winre_menu import Menu
+
+    identity = TargetIdentity(
+        "25H2", 26200, 9974, "x64", tmp_path / "Windows", OWNER, LOADER
+    )
+    menu = Menu(identity)
+    menu.root.mkdir(parents=True)
+    profile = tmp_path / "profile.toml"
+    profile.write_text(
+        "[[hooks]]\nphase = 'post'\nkey = 'Control'\nname = 'BootDriverFlags'\nvalue = 28\n",
+        encoding="ascii",
+    )
+    args = argparse.Namespace(
+        feature_iso=tmp_path / "Windows.iso",
+        iso_sha256="ab" * 32,
+        backup_drive=None,
+        dry_run=False,
+        only=["features"],
+        driver_cache=True,
+        extractor=None,
+    )
+
+    async def scan(*_: object, prepared: PreparedUpdates, **__: object) -> int:
+        prepared.feature = FeatureImage(1, 26300, 9457, "Core", "x64", "en-US")
+        return 0
+
+    monkeypatch.setattr(cli, "run_update", scan)
+    monkeypatch.setattr(Menu, "check_windows", lambda _: True)
+    monkeypatch.setattr("wuo.target.read_target", lambda: identity)
+    monkeypatch.setattr(
+        cli, "_confirm_feature_without_backup", lambda: pytest.fail("Offered staging")
+    )
+
+    async def run() -> int:
+        async with httpx.AsyncClient() as client:
+            return await cli._stage_update(
+                client, args, identity, menu, True, tmp_path, profile
+            )
+
+    with pytest.raises(ValueError, match="after SafeOS"):
+        asyncio.run(run())
+    assert "Preparing Windows Setup" not in capsys.readouterr().out
 
 
 def test_feature_verification_waits_for_boot_preservation_receipt(
