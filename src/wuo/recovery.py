@@ -16,7 +16,9 @@ if TYPE_CHECKING:
     from .target import TargetIdentity
 
 
-def _hook_lines(hooks: tuple[Hook, ...], *, revert_on_failure: bool = False) -> str:
+def _hook_lines(
+    hooks: tuple[Hook, ...], *, revert_on_failure: bool = False, live: bool = False
+) -> str:
     if not hooks:
         return "exit /b 0"
     lines = ["call :open_hook_hive || exit /b 1"]
@@ -40,12 +42,11 @@ def _hook_lines(hooks: tuple[Hook, ...], *, revert_on_failure: bool = False) -> 
                 lines.append(f"call :{operation}_hook || goto hook_failed")
             if revert_on_failure and operation == "inspect":
                 lines.append(f'set "ORIGINAL_{index}=%ACTUAL%"')
-    lines.extend(
-        (
-            r'"%SYS%\reg.exe" unload "%HOOK_HIVE%" >>"%LOG%" 2>&1 || exit /b 1',
-            "exit /b 0",
+    if not live:
+        lines.append(
+            r'"%SYS%\reg.exe" unload "%HOOK_HIVE%" >>"%LOG%" 2>&1 || exit /b 1'
         )
-    )
+    lines.append("exit /b 0")
     if revert_on_failure:
         for index, hook in reversed(list(enumerate(hooks, 1))):
             path = "%HOOK_HIVE%"
@@ -69,7 +70,7 @@ def _hook_lines(hooks: tuple[Hook, ...], *, revert_on_failure: bool = False) -> 
     return "\n".join(lines)
 
 
-def _hook_helpers(system_hive: str, *, backup: bool) -> str:
+def _hook_helpers(system_hive: str | None, *, backup: bool) -> str:
     template = (
         files("wuo").joinpath("registry_hooks.cmd.in").read_text(encoding="ascii")
     )
@@ -79,9 +80,20 @@ def _hook_helpers(system_hive: str, *, backup: bool) -> str:
         if backup
         else ""
     )
+    mount = (
+        rf'"%SYS%\reg.exe" load "%HOOK_HIVE%" "{system_hive}" >>"%LOG%" 2>&1 || exit /b 1'
+        if system_hive is not None
+        else ""
+    )
+    unmount = (
+        r'"%SYS%\reg.exe" unload "%HOOK_HIVE%" >>"%LOG%" 2>&1'
+        if system_hive is not None
+        else ""
+    )
     return (
         template.removesuffix("\n")
-        .replace("@@SYSTEM_HIVE@@", system_hive)
+        .replace("@@MOUNT@@", mount)
+        .replace("@@UNMOUNT@@", unmount)
         .replace("@@BACKUP_LINE@@", backup_line)
     )
 
@@ -120,17 +132,36 @@ def render_feature_precommit(
     return template.replace("\n", "\r\n")
 
 
-def render_feature_source_hooks(hooks: tuple[Hook, ...], *, rollback: bool) -> str:
-    """Apply source hooks in WinRE before authorizing native Setup."""
+def render_feature_source_hooks(
+    hooks: tuple[Hook, ...], *, rollback: bool, live: bool = False
+) -> str:
+    """Apply captured source hooks before native Setup."""
     source_hooks = tuple(hook for hook in hooks if hook.phase == "pre")
     template = (
         files("wuo").joinpath("feature_source_hooks.cmd.in").read_text(encoding="ascii")
     )
     return (
-        template.replace("@@HOOKS@@", _hook_lines(source_hooks, revert_on_failure=True))
+        template.replace(
+            "@@CHECK_ENV@@",
+            ("if /i " if live else "if /i not ")
+            + '"%SystemRoot%"=="X:\\Windows" exit /b 1',
+        )
+        .replace("@@HIVE@@", r"HKLM\SYSTEM" if live else r"HKLM\WUO_FEATURE_SOURCE")
+        .replace(
+            "@@CHECK_TARGET@@",
+            ""
+            if live
+            else r'if not exist "%TARGET%\Windows\System32\Config\SYSTEM" exit /b 1',
+        )
+        .replace(
+            "@@HOOKS@@", _hook_lines(source_hooks, revert_on_failure=True, live=live)
+        )
         .replace(
             "@@HOOK_HELPERS@@",
-            _hook_helpers(r"%TARGET%\Windows\System32\Config\SYSTEM", backup=rollback),
+            _hook_helpers(
+                None if live else r"%TARGET%\Windows\System32\Config\SYSTEM",
+                backup=rollback,
+            ),
         )
         .replace("\n", "\r\n")
     )

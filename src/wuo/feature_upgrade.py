@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from hashlib import sha256
 from importlib.resources import as_file, files
 from pathlib import Path
@@ -34,6 +35,7 @@ class FeatureMedia:
     rollback: bool = False
     preserve_boot_order: bool = False
     recovery_drive: str | None = None
+    start_in_windows: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +61,10 @@ def feature_setup_assets(
     if image.architecture != identity.architecture:
         raise ValueError("The verified image does not match the running architecture.")
     protected = media.recovery_drive is not None
+    if media.start_in_windows and not protected:
+        raise ValueError(
+            "A direct protected upgrade requires independent recovery media."
+        )
     if protected and not (media.rollback and media.preserve_boot_order):
         raise ValueError(
             "Protected feature upgrades require backup and boot preservation."
@@ -77,6 +83,8 @@ def feature_setup_assets(
         "callback_sha256": sha256(callback).hexdigest(),
         "rollback": media.rollback,
     }
+    if media.start_in_windows:
+        request["start_in_windows"] = True
     return json.dumps(request, sort_keys=True).encode("ascii"), callback
 
 
@@ -87,6 +95,8 @@ def render_feature_safeos(
     recovery_entry: str,
     loader: str,
     recovery_efi_volume: str,
+    *,
+    preflight_receipt: str = "",
 ) -> bytes:
     volume = re.compile(
         r"\\\\\?\\Volume\{[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\}\\", re.I
@@ -103,6 +113,10 @@ def render_feature_safeos(
     guid = str(UUID(recovery_entry.strip("{}")))
     if recovery_entry.lower() != f"{{{guid}}}":
         raise ValueError("Invalid recovery firmware application ID.")
+    if preflight_receipt and not re.fullmatch(
+        rf"v1 {job} [0-9a-f]{{64}} [0-9]+", preflight_receipt
+    ):
+        raise ValueError("Invalid SafeOS recovery check receipt.")
     script = files("wuo").joinpath("feature_safeos.cmd.in").read_text(encoding="ascii")
     for key, value in {
         "JOB": str(job),
@@ -111,6 +125,8 @@ def render_feature_safeos(
         "RECOVERY_EFI": recovery_efi_volume,
         "RECOVERY": recovery_entry.lower(),
         "LOADER": loader,
+        "REQUIRE_PREFLIGHT": "1" if preflight_receipt else "",
+        "PREFLIGHT_RECEIPT": preflight_receipt,
     }.items():
         script = script.replace(f"@@{key}@@", value)
     return script.replace("\n", "\r\n").encode("ascii")
@@ -312,6 +328,79 @@ def _run_native(
     return stdout
 
 
+def feature_setup_progress(identity: TargetIdentity, job: Path) -> str:
+    import winreg
+
+    setup = job / "protected-stage.log"
+    if not setup.is_file() or not (job / "claimed.id").is_file():
+        return "Starting Windows Setup and validating the staged upgrade."
+    if (job / "protected-reboot.ready").is_file():
+        return "Recovery is ready. Windows will restart automatically in a few seconds."
+    if (job / "finalize.result").is_file():
+        return "Windows Setup finished preparing. Verifying the recovery handoff."
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\Setup\MoSetup\Volatile"
+        ) as key:
+            progress, kind = winreg.QueryValueEx(key, "SetupProgress")
+        if kind == winreg.REG_DWORD and type(progress) is int and 0 <= progress <= 100:
+            return (
+                f"Windows Setup is preparing the upgrade ({progress}% of this phase)."
+            )
+    except OSError:
+        pass
+    try:
+        started = datetime.fromtimestamp((job / "windows-started.id").stat().st_mtime)
+        cutoff = started.isoformat(sep=" ", timespec="seconds")
+        log = identity.windows.parent / "$WINDOWS.~BT/Sources/Panther/setupact.log"
+        with log.open("rb") as stream:
+            end = stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, end - 64 * 1024))
+            recent = stream.read(64 * 1024).decode("utf-8", errors="replace")
+        progress_lines = re.findall(
+            r"(?mi)^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d),[^\n]*?Overall progress: \[(\d{1,3})%\]",
+            recent,
+        )
+        if progress_lines and progress_lines[-1][0] >= cutoff:
+            progress = int(progress_lines[-1][1])
+            if 0 <= progress <= 100:
+                return f"Windows Setup is preparing the upgrade ({progress}% of this phase)."
+    except OSError:
+        pass
+    return "Windows Setup is preparing the upgrade."
+
+
+async def watch_feature_setup(identity: TargetIdentity, job: Path) -> None:
+    """Report the Windows phase until Setup hands off to recovery."""
+    previous = ""
+    loop = asyncio.get_running_loop()
+    start_deadline = loop.time() + 120
+    last_report = loop.time()
+    error = job / "windows-start-error.log"
+    ready = job / "protected-reboot.id"
+    while True:
+        if error.is_file():
+            detail = error.read_text(encoding="utf-8-sig", errors="replace").strip()
+            raise ValueError(
+                f"{detail or 'The feature upgrade could not start.'} Log: {job}"
+            )
+        status = await asyncio.to_thread(feature_setup_progress, identity, job)
+        if status != previous or loop.time() - last_report >= 30:
+            print(status, flush=True)
+            previous, last_report = status, loop.time()
+        if ready.is_file() and ready.read_bytes() == f"{job.name}\r\n".encode("ascii"):
+            print(
+                "Automatic recovery is starting. Keep the recovery and backup drives connected.",
+                flush=True,
+            )
+            return
+        if loop.time() >= start_deadline and not (job / "windows-started.id").is_file():
+            raise ValueError(
+                f"The Windows Setup task has not started. Run wuo status. Job: {job}"
+            )
+        await asyncio.sleep(2)
+
+
 def feature_boot(
     identity: TargetIdentity,
     mode: Literal["Preview", "Capture"],
@@ -398,6 +487,18 @@ def prepare_independent_recovery(
     volumes = json.loads(rollback)
     restore = job / "restore.cmd"
     receipt = feature_recovery_receipt(job_id, image, hooks)
+    original_bcd_sha256 = ""
+    if media.start_in_windows:
+        captured_bcd = [
+            item["sha256"]
+            for item in volumes["boot_files"]
+            if item["path"].casefold() == r"efi\microsoft\boot\bcd"
+        ]
+        if len(captured_bcd) != 1:
+            raise ValueError(
+                "The rollback does not contain one original Windows BCD store."
+            )
+        original_bcd_sha256 = captured_bcd[0]
     runner = render_feature_recovery(
         job_id,
         identity,
@@ -412,6 +513,8 @@ def prepare_independent_recovery(
         recovery_loader_sha256=str(selection["loader_sha256"]),
         restore_sha256=sha256(restore.read_bytes()).hexdigest(),
         rollback_sha256=sha256(rollback).hexdigest(),
+        start_in_windows=media.start_in_windows,
+        original_bcd_sha256=original_bcd_sha256,
     )
     wrapper = render_feature_safeos(
         job_id,
@@ -420,6 +523,9 @@ def prepare_independent_recovery(
         str(selection["bcd_id"]),
         str(selection["loader"]),
         str(selection["efi_volume"]),
+        preflight_receipt=receipt.decode("ascii").removesuffix("\r\n")
+        if media.start_in_windows
+        else "",
     )
     helper = files("wuo").joinpath("feature_safeos.ps1").read_bytes()
     (job / "feature_safeos.ps1").write_bytes(helper)
@@ -537,6 +643,16 @@ def check_feature_retry(identity: TargetIdentity, job: str, *, staged: bool) -> 
         "feature_upgrade.ps1",
         "feature retry validation",
         arguments,
+        {},
+    )
+
+
+def check_failed_protected_feature(identity: TargetIdentity, job: str) -> None:
+    _run_native(
+        identity,
+        "feature_upgrade.ps1",
+        "failed feature-upgrade check",
+        ["-CheckDiscardJob", str(UUID(job))],
         {},
     )
 
