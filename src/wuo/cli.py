@@ -115,10 +115,24 @@ async def _stage_update(
             args.iso_sha256,
             rollback=bool(args.backup_drive),
             preserve_boot_order=getattr(args, "preserve_boot_order", False),
+            recovery_drive=getattr(args, "recovery_drive", None),
         )
         if iso is not None
         else None
     )
+    if args.dry_run and feature_media and feature_media.recovery_drive:
+        from .feature_upgrade import feature_recovery_selection
+
+        recovery = await asyncio.to_thread(
+            feature_recovery_selection,
+            identity,
+            feature_media.recovery_drive,
+            args.backup_drive,
+        )
+        print(
+            f"Verified independent recovery entry {recovery['id']} "
+            f"on the Ventoy drive {feature_media.recovery_drive}."
+        )
 
     async def scan(
         prepared: PreparedUpdates | None = None, *, dry_run: bool = args.dry_run
@@ -185,7 +199,8 @@ async def _stage_update(
                     "Resolve the other update failures before preparing the full feature upgrade."
                 )
                 return result
-            require_full_upgrade_hook_support(read_selection(profile).hooks)
+            if feature_media.recovery_drive is None:
+                require_full_upgrade_hook_support(read_selection(profile).hooks)
             current = await asyncio.to_thread(target.read_target)
             if replace(current, loader_guid=identity.loader_guid) != identity:
                 raise ValueError("The running Windows build changed during the scan.")
@@ -193,10 +208,13 @@ async def _stage_update(
             if not feature_media.rollback and not _confirm_feature_without_backup():
                 print("Feature upgrade canceled before staging.")
                 return 1
-            print(
-                "Preparing Windows Setup. Use Troubleshoot > wuo to continue after preparation."
-            )
-            await asyncio.to_thread(
+            if feature_media.recovery_drive is None:
+                print(
+                    "Preparing Windows Setup. Use Troubleshoot > wuo to continue after preparation."
+                )
+            else:
+                print("Preparing the rollback backup and independent Ventoy recovery.")
+            job = await asyncio.to_thread(
                 menu.stage_feature,
                 feature_media,
                 prepared.feature,
@@ -204,7 +222,13 @@ async def _stage_update(
                 backup_drive=args.backup_drive,
             )
             print("Feature upgrade staged.")
-            await asyncio.to_thread(menu.offer_restart)
+            if feature_media.recovery_drive is None:
+                await asyncio.to_thread(menu.offer_restart)
+            else:
+                print(
+                    f"Boot Ventoy once and let it select WUO-Recovery-{job.name}.iso automatically. "
+                    "Return to Windows and run wuo update after it succeeds."
+                )
             return 0
         category = "monthly" if prepared.monthly else "drivers"
         if prepared.feature is not None:
@@ -432,6 +456,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Preserve UEFI boot order and the existing EFI fallback loader after a full feature upgrade.",
     )
     workflow.add_argument(
+        "--recovery-drive",
+        metavar="DRIVE",
+        help="Use a separate GPT Ventoy USB drive for protected feature-upgrade hooks and recovery.",
+    )
+    workflow.add_argument(
         "--driver-cache",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -598,6 +627,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     workflow.error(
                         "--feature-iso requires --iso-sha256 and --accept-setup-eula"
                     )
+                if args.recovery_drive and (
+                    not args.backup_drive or not args.preserve_boot_order
+                ):
+                    workflow.error(
+                        "--recovery-drive requires --backup-drive and --preserve-boot-order"
+                    )
                 preparing = not args.dry_run and (
                     not args.only or "features" in args.only
                 )
@@ -611,6 +646,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 or args.no_rollback
                 or args.backup_drive
                 or args.preserve_boot_order
+                or args.recovery_drive
             ):
                 workflow.error("ISO and feature recovery options require --feature-iso")
     except SystemExit as result:

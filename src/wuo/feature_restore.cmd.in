@@ -7,6 +7,7 @@ set "WORK=X:\Windows\Temp\wuo-rollback-%RANDOM%-%RANDOM%"
 mkdir "%WORK%" || exit /b 1
 set "WINDOWS="
 set "EFI="
+set "TEMP_EFI="
 set "BACKUP="
 set "CONFLICT="
 for %%D in (C D E F G H I J K L M N O P Q R S T U V W Y Z) do call :detect %%D:
@@ -24,6 +25,9 @@ set "TOOLS=%~2"
 if not defined TOOLS set "TOOLS=%~dp0"
 if not exist "%TOOLS%certutil.exe" goto wrong_volumes
 if not exist "%TOOLS%findstr.exe" goto wrong_volumes
+@@PROTECTED_REQUIREMENTS@@
+if not exist "%SYS%\robocopy.exe" goto invalid_catalog
+if not exist "%SYS%\wbadmin.exe" goto invalid_catalog
 if not exist "%SNAPSHOT%\rollback.json" goto wrong_volumes
 set "VERIFY_ROOT=%SNAPSHOT%"
 call :verify_efi || goto invalid_backup
@@ -31,25 +35,23 @@ for /f "delims=" %%F in ('dir /b /s /a:l "%SNAPSHOT%\EFI\Microsoft\Boot" 2^>nul'
 set "BOOT_COUNT=0"
 for /f "delims=" %%F in ('dir /b /s /a:-d "%SNAPSHOT%\EFI\Microsoft\Boot" 2^>nul') do call :count_backup_file "%%~nxF"
 if not "%BOOT_COUNT%"=="@@BOOT_FILE_COUNT@@" goto invalid_backup
+"%SYS%\wbadmin.exe" get items "-version:@@VERSION@@" "-backupTarget:%BACKUP%" "-machine:@@COMPUTER@@" >"%WORK%\catalog.txt" 2>&1 || goto invalid_catalog
 if /i "%~1"=="check_backup" (
-    if not exist "%SYS%\robocopy.exe" goto invalid_catalog
     if not exist "%SNAPSHOT%\recovery\restore.cmd" goto invalid_catalog
-    "%SYS%\wbadmin.exe" get items "-version:@@VERSION@@" "-backupTarget:%BACKUP%" "-machine:@@COMPUTER@@" >"%WORK%\catalog.txt" 2>&1 || goto invalid_catalog
     echo Verified the rollback backup and recovery tools.
     goto success
 )
+@@RESUME_CHECK@@
 set "VERIFY_ROOT=%WINDOWS%\Windows.old\Windows"
-call :load_identity @@SOURCE_BUILD@@ @@SOURCE_UBR@@ || goto wrong_windows
+call :load_identity @@SOURCE_BUILD@@ @@SOURCE_UBR@@ || goto @@PRE_SWAP_FAILURE@@
 set "VERIFY_ROOT=%WINDOWS%\Windows"
-call :load_identity @@TARGET_BUILD@@ @@TARGET_UBR@@ || goto wrong_windows
-call :verify_pending || goto wrong_windows
+@@REPLACEMENT_CHECK@@
+@@PRE_SWAP_BRANCH@@
 if /i "%~1"=="check" (
-    echo Feature rollback backup and committed Windows installation verified.
+    echo Feature rollback backup and Windows installation verified.
     goto success
 )
-if exist "%SNAPSHOT%\restore.started" goto interrupted
-(>"%SNAPSHOT%\restore.started" echo @@JOB@@) || goto failed
-"%SYS%\wbadmin.exe" get items "-version:@@VERSION@@" "-backupTarget:%BACKUP%" "-machine:@@COMPUTER@@" >>"%LOG%" 2>&1 || goto failed
+@@START_RESTORE@@
 "%SYS%\wbadmin.exe" start recovery "-version:@@VERSION@@" "-backupTarget:%BACKUP%" "-machine:@@COMPUTER@@" -itemtype:Volume -items:@@ORIGINAL_LETTER@@ "-recoveryTarget:%WINDOWS%" -quiet >>"%LOG%" 2>&1 || goto failed
 call :load_identity @@SOURCE_BUILD@@ @@SOURCE_UBR@@ || goto failed
 "%SYS%\robocopy.exe" "%SNAPSHOT%\EFI\Microsoft\Boot" "%EFI%\EFI\Microsoft\Boot" /MIR /COPY:DAT /DCOPY:DAT /R:0 /W:0 /XJ /XF BCD.LOG BCD.LOG1 BCD.LOG2 >>"%LOG%" 2>&1
@@ -58,11 +60,13 @@ for %%J in (BCD.LOG BCD.LOG1 BCD.LOG2) do if exist "%EFI%\EFI\Microsoft\Boot\%%J
 @@RESTORE_EXTRA@@
 set "VERIFY_ROOT=%EFI%"
 call :verify_efi || goto failed
+@@PROTECTED_QUEUE@@
 (>"%SNAPSHOT%\restore.done" echo @@JOB@@) || goto failed
 @@RESTORE_BOOT_ORDER@@
 echo The previous Windows installation and EFI files were restored.
 goto success
 
+@@PROTECTED_SUBROUTINES@@
 :detect
 set "VOLUME="
 "%SYS%\mountvol.exe" %~1\ /L >"%WORK%\volume.txt" 2>nul || exit /b 0
@@ -91,7 +95,7 @@ exit /b 0
 :load_identity
 set "HIVE=HKLM\WUO_ROLLBACK_@@JOB@@"
 "%SYS%\reg.exe" load "%HIVE%" "%VERIFY_ROOT%\System32\Config\SOFTWARE" >nul 2>&1 || exit /b 1
-call :verify_identity %~1 %~2
+call :verify_identity %~1 %~2 %~3
 set "IDENTITY_EXIT=%ERRORLEVEL%"
 "%SYS%\reg.exe" unload "%HIVE%" >nul 2>&1 || exit /b 1
 exit /b %IDENTITY_EXIT%
@@ -100,7 +104,8 @@ exit /b %IDENTITY_EXIT%
 call :verify_value "%HIVE%\Microsoft\Cryptography" MachineGuid REG_SZ @@MACHINE@@ || exit /b 1
 set "VERSION_KEY=%HIVE%\Microsoft\Windows NT\CurrentVersion"
 call :verify_value "%VERSION_KEY%" CurrentBuildNumber REG_SZ %~1 || exit /b 1
-call :verify_value "%VERSION_KEY%" UBR REG_DWORD %~2 || exit /b 1
+if /i not "%~2"=="any" call :verify_value "%VERSION_KEY%" UBR REG_DWORD %~2 || exit /b 1
+if not "%~3"=="" call :verify_value "%VERSION_KEY%" EditionID REG_SZ %~3 || exit /b 1
 exit /b 0
 
 :verify_pending

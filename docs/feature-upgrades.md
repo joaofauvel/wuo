@@ -1,25 +1,29 @@
-# Hooks before the first boot of a feature upgrade
+# Feature upgrades from a Windows ISO
 
-`0.4.1rc4` can check compatibility with an ISO and prepare an eligible
-full Windows Setup upgrade. Eligible jobs continue from **Troubleshoot →
-wuo** in the installed Windows Recovery Environment (WinRE). The native
-upgrade completed in a split-EFI NVMe VM without hooks. Physical USB4 and
-Limine setups still require validation.
+## Protected upgrades with post hooks
 
-The `wuo` CLI blocks staging, offering a restart, and retrying a full ISO
-job with any post hook, including `official/usb4`. These hooks require
-verification after SafeOS and before the replacement Windows installation
-boots. In the VM, the native **Windows Rollback** entry could recreate the
-replacement boot request and restart. The required recovery handoff is
-still under development.
-`wuo retry-feature --dry-run` reports this block before checking the
-backup. ISO compatibility previews still check the media. Keep your boot
-hooks enabled for cumulative updates, drivers, and enablement packages.
-An earlier WinRE launcher can still authorize a job staged by an earlier
-release. Use `wuo status` to inspect the job from Windows and leave it
-unapproved in WinRE. If that launcher already authorized the job, its saved
-startup task can still continue Setup on a normal reboot. Retain its recovery
-files.
+Use the protected route with an x64 English (United States) Microsoft ISO,
+a GPT Ventoy USB drive, and a separate NTFS backup drive. Wuo uses the
+generated recovery image to apply the captured post hooks before the upgraded
+Windows boots. Keep both drives connected through the upgrade.
+
+If an older release installed your WinRE menu, finish any pending job,
+run `wuo remove`, and run `wuo setup` with your selected hooks again.
+
+```powershell
+wuo update --only features --feature-iso $iso --iso-sha256 $sha256 --accept-setup-eula --backup-drive D: --recovery-drive E: --preserve-boot-order
+```
+
+1. Wuo backs up Windows and EFI, builds the job's recovery image, and temporarily
+   selects it as Ventoy's default. Use the one-time UEFI boot menu to boot Ventoy
+   and let it select the generated image. Wait for the preflight result.
+2. Return to Windows and run `wuo update`. In WinRE, choose **Troubleshoot →
+   wuo** to authorize the staged job. After the upgrade, run `wuo status` in Windows.
+
+If independent recovery reports a failure, use the restore command shown
+there. It requires confirmation before restoring the saved Windows and EFI
+files. Before WinRE authorizes a protected job, `wuo status --discard` restores
+the prior Ventoy selection and retains the backup and logs.
 
 ## Compatibility preview
 

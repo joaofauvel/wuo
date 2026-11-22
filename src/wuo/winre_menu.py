@@ -8,6 +8,7 @@ import sys
 import tempfile
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
+from hashlib import sha256
 from importlib.resources import as_file, files
 from pathlib import Path
 from stat import FILE_ATTRIBUTE_REPARSE_POINT
@@ -26,7 +27,7 @@ lazy from .update import Offer
 
 MENU_PATH = bundle.JOBS_PATH.parent / "menu"
 _FEATURE_MENU = "feature-menu.version"
-_FEATURE_MENU_VERSION = b"2\r\n"
+_FEATURE_MENU_VERSION = b"3\r\n"
 _FEATURE_FAILURE_RECORDS = (
     "boot-completion.phase",
     "boot-order-result.json",
@@ -53,6 +54,21 @@ def _read_id(path: Path) -> str | None:
 
 
 def _require_captured_feature_hook_support(state: Path) -> None:
+    if (state / "feature.protected").is_file():
+        request = json.loads((state / "feature.json").read_bytes())
+        if (
+            request.get("schema") != 2
+            or _read_id(state / "feature.protected") != state.name
+        ):
+            raise ValueError("The protected feature job is invalid.")
+        receipt = state / "independent-preflight.done"
+        expected = f"{request['recovery']['receipt']}\r\n".encode("ascii")
+        if not receipt.is_file() or receipt.read_bytes() != expected:
+            raise ValueError(
+                f"Boot the selected Ventoy drive and wait for its preflight. It should select WUO-Recovery-{state.name}.iso automatically. "
+                "Return to Windows and run wuo update after it succeeds."
+            )
+        return
     profile = state / "profile.toml"
     if profile.is_file():
         require_full_upgrade_hook_support(read_selection(profile).hooks)
@@ -182,7 +198,9 @@ class Menu:
         from .feature_upgrade import (
             backup_feature,
             feature_boot,
+            feature_recovery_selection,
             feature_setup_assets,
+            prepare_independent_recovery,
             prepare_media,
         )
         from .recovery import render_feature_restore, render_feature_source_hooks
@@ -195,15 +213,31 @@ class Menu:
             if self._pending_id() is not None:
                 raise ValueError("An update is already staged. Run wuo status.")
             capability = self.root / _FEATURE_MENU
-            if (
-                not capability.is_file()
-                or capability.read_bytes() != _FEATURE_MENU_VERSION
-            ):
+            versions = (
+                {_FEATURE_MENU_VERSION}
+                if media.recovery_drive is not None
+                else {_FEATURE_MENU_VERSION, b"2\r\n"}
+            )
+            if not capability.is_file() or capability.read_bytes() not in versions:
                 raise ValueError(
                     "Refresh the recovery menu with wuo remove and wuo setup before preparing a feature upgrade."
                 )
             selected = read_selection(profile)
-            require_full_upgrade_hook_support(selected.hooks)
+            recovery = None
+            if media.recovery_drive is None:
+                require_full_upgrade_hook_support(selected.hooks)
+            else:
+                if not backup_drive or not media.preserve_boot_order:
+                    raise ValueError(
+                        "Protected feature upgrades require --backup-drive and --preserve-boot-order."
+                    )
+                if image.architecture != "x64" or image.language.lower() != "en-us":
+                    raise ValueError(
+                        "Protected feature recovery requires x64 en-US media."
+                    )
+                recovery = feature_recovery_selection(
+                    self.target, media.recovery_drive, backup_drive
+                )
             if read_target() != self.target:
                 raise ValueError(
                     "The running Windows identity changed before preparation."
@@ -260,6 +294,7 @@ class Menu:
                 # A volume rollback must restore the task as well as the snapshot.
                 self._register_feature_task(str(job_id), continuation)
             marker = f"{job_id}\r\n".encode("ascii")
+            receipt = None
             if any(hook.phase == "pre" for hook in selected.hooks):
                 pre_hooks = job / "source-hooks.cmd"
                 pre_hooks.write_bytes(
@@ -271,6 +306,13 @@ class Menu:
                     f"{package_hashes(pre_hooks)[0]}\r\n".encode("ascii")
                 )
             if media.rollback and backup_drive is not None:
+                hook_receipt_sha256 = ""
+                if recovery is not None:
+                    from .feature_recovery import feature_recovery_receipt
+
+                    hook_receipt_sha256 = sha256(
+                        feature_recovery_receipt(job_id, image, selected.hooks)
+                    ).hexdigest()
                 receipt, snapshot = backup_feature(self.target, job_id, backup_drive)
                 runner = job / "restore.cmd"
                 runner.write_bytes(
@@ -280,6 +322,8 @@ class Menu:
                         image,
                         receipt,
                         preserve_boot_order=media.preserve_boot_order,
+                        protected=recovery is not None,
+                        hook_receipt_sha256=hook_receipt_sha256,
                     ).encode("ascii")
                 )
                 (job / "rollback.json").write_bytes(receipt)
@@ -288,6 +332,16 @@ class Menu:
                 )
                 self._export_feature_restore(snapshot, job, boot_assets=boot_assets)
                 (job / "rollback.required").write_bytes(marker)
+            if recovery is not None:
+                assert receipt is not None
+                manifest = json.loads(request)
+                manifest["recovery"] = prepare_independent_recovery(
+                    self.target, media, image, job, selected.hooks, recovery, receipt
+                )
+                (job / "feature.json").write_bytes(
+                    json.dumps(manifest, sort_keys=True).encode("ascii")
+                )
+                (job / "feature.protected").write_bytes(marker)
             callback_dir.mkdir(parents=True)
             (callback_dir / "precommit.cmd").write_bytes(callback)
             if boot_assets:
@@ -301,7 +355,8 @@ class Menu:
                             f"-CompleteJob {job_id} -Outcome {outcome}\r\nexit /b 0\r\n"
                         ).encode("ascii")
                     )
-            prepare_media(self.target, media, image)
+            if recovery is None:
+                prepare_media(self.target, media, image)
             if not media.preserve_boot_order:
                 self._register_feature_task(str(job_id), continuation)
             (job / "target.id").write_bytes(marker)
@@ -334,6 +389,7 @@ class Menu:
             job / "restore.sha256",
             system32 / "certutil.exe",
             system32 / "findstr.exe",
+            system32 / "fc.exe",
             *(asset for asset in boot_assets if asset.name != "feature_boot.ps1"),
         )
         with tempfile.TemporaryDirectory(dir=snapshot) as work:
@@ -504,6 +560,13 @@ class Menu:
             )
         profile = state / "profile.toml"
         hooks = read_selection(profile if profile.is_file() else None).hooks
+        if request.get("schema") == 2:
+            receipt = state / "independent-hooks.done"
+            expected = f"{request['recovery']['receipt']}\r\n".encode("ascii")
+            if not receipt.is_file() or receipt.read_bytes() != expected:
+                raise ValueError(
+                    f"The independent recovery hook receipt is missing or invalid. Review {state}."
+                )
         if hooks:
             import winreg
 
@@ -526,6 +589,22 @@ class Menu:
         if request.get("boot_preservation") and not self._describe_boot_result(state):
             print(f"Boot preservation result is pending. Job: {state}")
             return False
+        if request.get("schema") == 2:
+            report = json.loads((state / "boot-order-result.json").read_bytes())
+            if report["order"] not in {"restored", "unchanged"} or report[
+                "fallback"
+            ] not in {"restored", "unchanged", "absent"}:
+                print(
+                    f"The protected feature job is waiting for boot preservation. Review {state}."
+                )
+                return False
+            from .feature_ventoy import restore_recovery_media
+
+            restore_recovery_media(
+                Path(request["recovery"]["entry"]["media_volume"]),
+                UUID(job_id),
+                state / "ventoy-state.json",
+            )
         print(
             f"Feature upgrade verified on build {self.target.build}.{self.target.revision}. Log: {state / 'precommit.log'}"
         )
@@ -592,8 +671,13 @@ class Menu:
                             f"Windows Setup completed its feature job. Review {state}."
                         )
                 elif (state / "claimed.id").is_file():
+                    log = (
+                        "protected-stage.log"
+                        if (state / "feature.protected").is_file()
+                        else "precommit.log"
+                    )
                     print(
-                        f"Windows Setup started the feature upgrade. Review {state / 'precommit.log'}."
+                        f"Windows Setup started the feature upgrade. Review {state / log}."
                     )
                 else:
                     authorized = (state / "authorized.id").is_file()
@@ -834,9 +918,34 @@ class Menu:
                 job_id is not None
                 and (self.job_state(job_id) / "feature.ready").is_file()
             ):
-                raise ValueError(
-                    "The feature upgrade has native Setup state. Review wuo status before clearing it."
+                state = self.job_state(job_id)
+                if _read_id(state / "feature.protected") != job_id or any(
+                    (state / name).exists()
+                    for name in ("authorized.id", "claimed.id", "safeos.ready")
+                ):
+                    raise ValueError(
+                        "The feature upgrade may have native Setup state. Review wuo status before clearing it."
+                    )
+                request = json.loads((state / "feature.json").read_bytes())
+                if request.get("schema") != 2 or request.get("id") != job_id:
+                    raise ValueError("The protected feature job could not be verified.")
+                from .feature_ventoy import restore_recovery_media
+
+                restore_recovery_media(
+                    Path(request["recovery"]["entry"]["media_volume"]),
+                    UUID(job_id),
+                    state / "ventoy-state.json",
                 )
+                callbacks = self.target.windows / "System32/update/runonce" / job_id
+                if callbacks.is_dir():
+                    _check_callback(
+                        callbacks / "precommit.cmd", request["callback_sha256"]
+                    )
+                    if state.resolve() != state or callbacks.resolve() != callbacks:
+                        raise ValueError(
+                            "The protected job uses an unexpected callback path."
+                        )
+                    callbacks.rename(state / "archived-setup-callbacks")
             (self.root / "pending.id").unlink(missing_ok=True)
         print("Pending job cleared. Its files and logs are retained.")
 

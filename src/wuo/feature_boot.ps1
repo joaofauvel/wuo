@@ -1,7 +1,9 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('Preview', 'Capture', 'Restore')][string]$Mode,
-    [string]$JobPath
+    [ValidateSet('Preview', 'Capture', 'Restore', 'Recovery')][string]$Mode,
+    [string]$JobPath,
+    [ValidatePattern('^[A-Z]:$')][string]$RecoveryDrive,
+    [ValidatePattern('^[A-Z]:$')][string]$BackupDrive
 )
 
 $ErrorActionPreference = 'Stop'
@@ -12,6 +14,7 @@ function Initialize-WuoBootNative {
 using System;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using System.Text;
 
 public static class WuoBootNative
 {
@@ -62,6 +65,8 @@ public static class WuoBootNative
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)]
     private static extern bool MoveFileExW(string from, string to, uint flags);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)]
+    private static extern uint QueryDosDeviceW(string name, StringBuilder device, int capacity);
 
     private sealed class FirmwarePrivilege : IDisposable
     {
@@ -107,7 +112,7 @@ public static class WuoBootNative
         }
     }
 
-    public static byte[] Read(string name, out uint attributes)
+    public static byte[] Read(string name, out uint attributes, bool allowMissing)
     {
         using (new FirmwarePrivilege())
         {
@@ -115,7 +120,11 @@ public static class WuoBootNative
             uint length = GetFirmwareEnvironmentVariableExW(name, EfiGlobal, data,
                 (uint)data.Length, out attributes);
             if (length == 0)
-                throw new Win32Exception(Marshal.GetLastWin32Error());
+            {
+                int error = Marshal.GetLastWin32Error();
+                if (allowMissing && error == 203) return null;  // ERROR_ENVVAR_NOT_FOUND
+                throw new Win32Exception(error);
+            }
             Array.Resize(ref data, (int)length);
             return data;
         }
@@ -132,6 +141,18 @@ public static class WuoBootNative
                 throw new Win32Exception(Marshal.GetLastWin32Error());
         }
     }
+    public static void WriteBootNext(byte[] data)
+    {
+        if (data.Length != 0 && data.Length != 2)
+            throw new ArgumentException("Invalid BootNext data.");
+        using (new FirmwarePrivilege())
+        {
+            uint attributes = data.Length == 0 ? 0U : 7U;
+            if (!SetFirmwareEnvironmentVariableExW("BootNext", EfiGlobal, data,
+                (uint)data.Length, attributes))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+    }
 
     public static void ReplaceFile(string from, string to)
     {
@@ -139,15 +160,23 @@ public static class WuoBootNative
         if (!MoveFileExW(from, to, 0x1 | 0x8))
             throw new Win32Exception(Marshal.GetLastWin32Error());
     }
+    public static string GetNtDevice(string name)
+    {
+        StringBuilder result = new StringBuilder(32768);
+        if (QueryDosDeviceW(name, result, result.Capacity) == 0)
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        return result.ToString().Split('\0')[0];
+    }
 }
 '@
 }
 
-function Get-WuoFirmwareVariable([string]$Name) {
+function Get-WuoFirmwareVariable([string]$Name, [switch]$AllowMissing) {
     Initialize-WuoBootNative
     $attributes = [uint32]0
-    try { $bytes = [WuoBootNative]::Read($Name, [ref]$attributes) }
+    try { $bytes = [WuoBootNative]::Read($Name, [ref]$attributes, $AllowMissing.IsPresent) }
     catch { throw "Could not read UEFI $Name. $($_.Exception.Message)" }
+    if ($null -eq $bytes) { return }
     return @{ bytes = $bytes; attributes = $attributes }
 }
 
@@ -279,7 +308,40 @@ function Get-WuoWindowsBootHash($Esp) {
     return $hash
 }
 
-function Get-WuoBootEntry([string]$Id) {
+function Get-WuoEfiLoadPath([byte[]]$Data, [int]$Start) {
+    if (([BitConverter]::ToUInt32($Data, 0) -band 1) -eq 0) { return }
+    $end = $Start + [BitConverter]::ToUInt16($Data, 4)
+    $partition = $null
+    $loader = $null
+    for ($offset = $Start; $offset + 4 -le $end; $offset += $length) {
+        $kind = [BitConverter]::ToUInt16($Data, $offset)
+        $length = [BitConverter]::ToUInt16($Data, $offset + 2)
+        if ($length -lt 4 -or $offset + $length -gt $end) { return }
+        if ($kind -eq 0xff7f) {
+            if ($length -eq 4 -and $offset + $length -eq $end -and $partition -and $loader) {
+                return @{ partition = $partition.ToString('D'); loader = $loader }
+            }
+            return
+        }
+        if ($kind -eq 0x0104) {
+            if ($partition -or $length -ne 42 -or $Data[$offset + 40] -ne 2 -or $Data[$offset + 41] -ne 2) {
+                return
+            }
+            $partition = [Guid]::new([byte[]]($Data[($offset + 24)..($offset + 39)]))
+            if ($partition -eq [Guid]::Empty) { return }
+        } elseif ($kind -eq 0x0404) {
+            if (!$partition -or $loader -or $length -lt 8 -or $length % 2 -ne 0 -or
+                [BitConverter]::ToUInt16($Data, $offset + $length - 2) -ne 0) { return }
+            $loader = [Text.Encoding]::Unicode.GetString($Data, $offset + 4, $length - 6)
+            if ($loader -notmatch '^\\EFI\\(?:[a-z0-9_-][a-z0-9_.-]*\\)*[a-z0-9_-][a-z0-9_.-]*\.efi$') { return }
+        } elseif ($partition -or $Data[$offset] -eq 0x7f) {
+            # Accept bus nodes before the partition. Reject multi-instance paths.
+            return
+        }
+    }
+}
+
+function Get-WuoBootEntry([string]$Id, [switch]$IncludeDevice) {
     $data = (Get-WuoFirmwareVariable $Id).bytes
     if ($data.Length -lt 8) { throw "Malformed UEFI entry $Id." }
     $descriptionEnd = 6
@@ -294,7 +356,116 @@ function Get-WuoBootEntry([string]$Id) {
     $identity = [byte[]]::new($data.Length - $deviceStart + 6)
     [Array]::Copy($data, 0, $identity, 0, 6)
     [Array]::Copy($data, $deviceStart, $identity, 6, $data.Length - $deviceStart)
-    return @{ id = $Id; identity = (Get-WuoHash $identity); label = $label }
+    $entry = @{ id = $Id; identity = (Get-WuoHash $identity); label = $label }
+    if ($IncludeDevice) {
+        $entry.device = Get-WuoEfiLoadPath $data $deviceStart
+        $optionStart = $deviceStart + [BitConverter]::ToUInt16($data, 4)
+        $optionLength = $data.Length - $optionStart
+        $entry.windows_registration = $false
+        if ($optionLength -ge 8 -and [Text.Encoding]::ASCII.GetString($data, $optionStart, 8) -ceq "WINDOWS`0") {
+            $text = [Text.Encoding]::Unicode.GetString($data, $optionStart, ($optionLength - ($optionLength % 2)))
+            $entry.windows_registration = $text -match 'BCDOBJECT=\{9dea862c-5cdd-4e70-acc1-f32b344d4795\}(?:\x00|$)'
+        }
+    }
+    return $entry
+}
+
+function Get-WuoRecoveryBootNext {
+    $next = Get-WuoFirmwareVariable 'BootNext' -AllowMissing
+    if ($null -eq $next) { return }
+    if ($next.attributes -ne 7 -or $next.bytes.Length -ne 2) {
+        throw 'UEFI BootNext has unsupported data or attributes.'
+    }
+    return ('Boot{0:X4}' -f [BitConverter]::ToUInt16($next.bytes, 0))
+}
+
+function Assert-WuoRecoveryBootNextIdle {
+    $next = Get-WuoRecoveryBootNext
+    if ($next) { throw "UEFI BootNext is already set to $next. Clear the pending boot before staging." }
+}
+
+function Set-WuoRecoveryBootNext([string]$Id) {
+    Initialize-WuoBootNative
+    if ($Id -and $Id -cnotmatch '^Boot[0-9A-F]{4}$') { throw 'Invalid UEFI BootNext entry.' }
+    [byte[]]$data = [byte[]]::new(0)
+    if ($Id) { $data = [BitConverter]::GetBytes([Convert]::ToUInt16($Id.Substring(4), 16)) }
+    [WuoBootNative]::WriteBootNext($data)
+}
+
+function Assert-WuoUnchangedBootEntry($Entry) {
+    if ($Entry.id -cnotmatch '^Boot[0-9A-F]{4}$' -or !$Entry.identity -or
+        (Get-WuoBootEntry $Entry.id).identity -cne $Entry.identity) {
+        throw 'The captured UEFI recovery entry changed.'
+    }
+}
+
+function Set-WuoProtectedSetupBoot($Entry, [ValidateSet('Arm', 'Release')][string]$Mode) {
+    Assert-WuoUnchangedBootEntry $Entry
+    if ($Mode -ceq 'Arm') {
+        Assert-WuoRecoveryBootNextIdle
+        $selected = $Entry.id
+    } else {
+        if ((Get-WuoRecoveryBootNext) -cne $Entry.id) {
+            throw 'UEFI BootNext no longer contains the recovery selection for this job.'
+        }
+        $selected = ''
+    }
+    Set-WuoRecoveryBootNext $selected
+    if ([string](Get-WuoRecoveryBootNext) -cne $selected) {
+        throw 'UEFI BootNext failed read-back verification.'
+    }
+}
+
+function Assert-WuoRecoveryFirst($Recovery) {
+    $first = (Get-WuoBootState).entries[0]
+    if ($first.id -cne $Recovery.id -or $first.identity -cne $Recovery.identity) {
+        throw 'UEFI BootOrder does not start with the captured recovery entry.'
+    }
+}
+
+function Set-WuoProtectedRecoveryOrder($Recovery) {
+    Assert-WuoUnchangedBootEntry $Recovery
+    if ((Get-WuoRecoveryBootNext) -cne $Recovery.id) {
+        throw 'UEFI BootNext must point to the recovery entry before changing BootOrder.'
+    }
+    $state = Get-WuoBootState
+    if ($Recovery.id -cnotin $state.entries.id) { throw 'The captured UEFI recovery entry is absent from BootOrder.' }
+    if ($state.entries[0].id -cne $Recovery.id) {
+        $ids = @($Recovery.id) + @($state.entries.id | Where-Object { $_ -cne $Recovery.id })
+        $data = [Collections.Generic.List[byte]]::new()
+        foreach ($id in $ids) {
+            $data.AddRange([BitConverter]::GetBytes([Convert]::ToUInt16($id.Substring(4), 16)))
+        }
+        Set-WuoBootOrder ($data.ToArray()) $state.attributes
+    }
+    Assert-WuoRecoveryFirst $Recovery
+}
+
+function Start-WuoSafeOsBoot($Recovery, $Windows) {
+    Assert-WuoUnchangedBootEntry $Recovery
+    Assert-WuoUnchangedBootEntry $Windows
+    Assert-WuoRecoveryFirst $Recovery
+    if ((Get-WuoRecoveryBootNext) -cne $Recovery.id -or $Windows.id -ceq $Recovery.id) {
+        throw 'UEFI BootNext no longer contains the recovery selection for this job.'
+    }
+    Set-WuoRecoveryBootNext $Windows.id
+    if ((Get-WuoRecoveryBootNext) -cne $Windows.id) { throw 'UEFI BootNext did not select Windows Boot Manager.' }
+}
+
+function Find-WuoRecoveryBcdId([string[]]$Firmware, [string[]]$Devices, [string]$Loader) {
+    $devicePattern = ($Devices | ForEach-Object { [regex]::Escape($_) }) -join '|'
+    $loaderPattern = [regex]::Escape($Loader)
+    $entries = @(foreach ($record in ($Firmware -join "`n") -split '\n[ \t]*\n') {
+        if ($record -match "(?im)^[^\n]+?[ \t]+partition=(?:$devicePattern)[ \t]*$" -and
+            $record -match "(?im)^[^\n]+?[ \t]+$loaderPattern[ \t]*$") {
+            $ids = [regex]::Matches($record, '(?im)^[^\n]+?[ \t]+(\{[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\})[ \t]*$')
+            if ($ids.Count -eq 1) { $ids[0].Groups[1].Value.ToLowerInvariant() }
+        }
+    })
+    if ($entries.Count -ne 1) {
+        throw 'Could not identify a unique recovery boot application in Windows Boot Configuration Data.'
+    }
+    return $entries[0]
 }
 
 function Get-WuoBootState {
@@ -310,6 +481,87 @@ function Get-WuoBootState {
         Get-WuoBootEntry $id
     }
     return @{ attributes = $order.attributes; entries = @($entries) }
+}
+
+function Get-WuoRecoveryVolumeName($Partition) {
+    $paths = @($Partition.AccessPaths | Where-Object {
+        $_ -match '^\\\\\?\\Volume\{[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\}\\$'
+    })
+    if ($paths.Count -ne 1) { throw 'The recovery partition does not have a unique volume name.' }
+    return $paths[0]
+}
+
+function Select-WuoWindowsBootEntry($Entries, [string]$EspId) {
+    $matches = @($Entries | Where-Object {
+        $_.device.partition -eq $EspId -and $_.device.loader -ieq '\EFI\Microsoft\Boot\bootmgfw.efi'
+    })
+    if ($matches.Count -eq 1) { return $matches[0] }
+    $registered = @($matches | Where-Object windows_registration)
+    if ($registered.Count -eq 1) { return $registered[0] }
+    throw 'Could not identify a unique UEFI Windows Boot Manager for the system EFI partition.'
+}
+
+function Find-WuoVentoyPartition($Partitions, $DataPartition) {
+    $paths = @(Get-Volume -FileSystemLabel 'VTOYEFI' -ErrorAction SilentlyContinue |
+        Where-Object { $_.FileSystem -in 'FAT', 'FAT32' } | ForEach-Object Path)
+    $matches = @($Partitions | Where-Object {
+        $partition = $_
+        $partition.DiskNumber -eq $DataPartition.DiskNumber -and
+            $partition.PartitionNumber -ne $DataPartition.PartitionNumber -and $partition.Guid -and
+            @($partition.AccessPaths | Where-Object { $_ -in $paths }).Count -eq 1
+    })
+    if ($matches.Count -ne 1) { throw 'Could not identify the VTOYEFI partition.' }
+    return $matches[0]
+}
+function Get-WuoRecoveryMedia([string]$Drive, [string]$Backup) {
+    if (!$Drive -or !$Backup) { throw 'Select separate Ventoy and backup drives.' }
+    Assert-WuoRecoveryBootNextIdle
+    $partitions = @(Get-Partition)
+    $media = @($partitions | Where-Object { $_.DriveLetter -eq $Drive[0] })
+    $excluded = @($partitions | Where-Object {
+        $_.IsSystem -or $_.DriveLetter -in $env:SystemDrive[0], $Backup[0]
+    })
+    if ($media.Count -ne 1 -or !$media[0].Guid -or $media[0].DiskNumber -in $excluded.DiskNumber) {
+        throw 'Use a Ventoy disk separate from Windows, system EFI, and the rollback drive.'
+    }
+    $disk = Get-Disk -Number $media[0].DiskNumber
+    if ($disk.PartitionStyle -ne 'GPT' -or $disk.BusType -ne 'USB') {
+        throw 'Protected recovery requires a GPT Ventoy USB disk.'
+    }
+    $bootPartition = Find-WuoVentoyPartition $partitions $media[0]
+    $esp = @{
+        id = ([Guid]$bootPartition.Guid).ToString('D')
+        root = Get-WuoRecoveryVolumeName $bootPartition
+    }
+    $fallback = Get-WuoFallbackPath
+    $loader = Get-WuoEspFile $esp $fallback
+    if (!$loader) { throw 'The Ventoy EFI loader is missing.' }
+    $entries = @((Get-WuoBootState).entries | ForEach-Object { Get-WuoBootEntry $_.id -IncludeDevice })
+    $matching = @($entries | Where-Object { $_.device.partition -eq $esp.id -and $_.device.loader -eq "\$fallback" })
+    if ($matching.Count -ne 1) { throw 'Boot the Ventoy disk in UEFI mode and verify it has a unique firmware entry.' }
+    $system = Get-WuoEsp
+    $windows = Select-WuoWindowsBootEntry $entries $system.id
+    Initialize-WuoBootNative
+    $name = $esp.root.Substring(4).TrimEnd('\')
+    $device = [WuoBootNative]::GetNtDevice($name)
+    if ($device -notmatch '^\\Device\\HarddiskVolume[0-9]+$') { throw 'The Ventoy EFI device is not a disk volume.' }
+    $aliases = @($device)
+    if ($bootPartition.DriveLetter -match '^[A-Z]$') { $aliases += "$($bootPartition.DriveLetter):" }
+    $firmware = & "$env:SystemRoot\System32\bcdedit.exe" /enum firmware /v
+    if ($LASTEXITCODE -ne 0) { throw 'Could not read UEFI boot applications from BCDEdit.' }
+    return @{
+        schema = 1
+        id = $matching[0].id
+        identity = $matching[0].identity
+        bcd_id = Find-WuoRecoveryBcdId $firmware $aliases "\$fallback"
+        loader = "\$fallback"
+        loader_sha256 = Get-WuoFileHash $loader
+        efi = $esp.id
+        efi_volume = $esp.root
+        media = ([Guid]$media[0].Guid).ToString('D')
+        media_volume = Get-WuoRecoveryVolumeName $media[0]
+        windows_entry = @{ id = $windows.id; identity = $windows.identity }
+    }
 }
 
 function Get-WuoOrderPlan($Saved, $Current) {
@@ -348,7 +600,15 @@ function Write-WuoResult([string]$Path, $Report) {
 
 function Restore-WuoOrder($Snapshot, $Esp) {
     $current = Get-WuoBootState
-    try { $desired = @(Get-WuoOrderPlan $Snapshot.entries $current.entries) }
+    $candidates = @($current.entries)
+    $detached = @(foreach ($saved in $Snapshot.entries) {
+        if ($saved.id -cin $current.entries.id -or $saved.identity -cin $current.entries.identity) { continue }
+        try { $entry = Get-WuoBootEntry $saved.id }
+        catch { continue }
+        if ($entry.identity -ceq $saved.identity) { $entry }
+    })
+    $candidates += $detached
+    try { $desired = @(Get-WuoOrderPlan $Snapshot.entries $candidates) }
     catch { return @{ status = 'blocked'; detail = $_.Exception.Message } }
     if (($current.entries.id -join ',') -ceq ($desired -join ',')) {
         return @{ status = 'unchanged'; detail = 'The original UEFI boot order is already in place.' }
@@ -359,10 +619,19 @@ function Restore-WuoOrder($Snapshot, $Esp) {
         ($fresh.entries.identity -join ',') -cne ($current.entries.identity -join ',')) {
         return @{ status = 'blocked'; detail = 'The EFI partition or boot entries changed while checking the boot order.' }
     }
+    foreach ($entry in $detached) {
+        try { Assert-WuoUnchangedBootEntry $entry }
+        catch { return @{ status = 'blocked'; detail = $_.Exception.Message } }
+    }
     $bytes = [Collections.Generic.List[byte]]::new()
     foreach ($id in $desired) { $bytes.AddRange([BitConverter]::GetBytes([Convert]::ToUInt16($id.Substring(4), 16))) }
     Set-WuoBootOrder $bytes.ToArray() $fresh.attributes
-    if (((Get-WuoBootState).entries.id -join ',') -cne ($desired -join ',')) {
+    $after = (Get-WuoBootState).entries
+    $expected = @{}
+    foreach ($entry in $candidates) { $expected[$entry.id] = $entry.identity }
+    $ordered = @(foreach ($id in $desired) { $expected[$id] })
+    if (($after.id -join ',') -cne ($desired -join ',') -or
+        ($after.identity -join ',') -cne ($ordered -join ',')) {
         throw 'Firmware readback differs from the requested boot order.'
     }
     return @{ status = 'restored'; detail = 'Restored and verified the original UEFI boot order.' }
@@ -492,5 +761,9 @@ function Invoke-WuoBootPreservation {
 
 if ($MyInvocation.InvocationName -ne '.') {
     [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
-    Invoke-WuoBootPreservation -Mode $Mode -JobPath $JobPath | ConvertTo-Json -Depth 6 -Compress
+    if ($Mode -eq 'Recovery') {
+        Get-WuoRecoveryMedia $RecoveryDrive $BackupDrive | ConvertTo-Json -Depth 6 -Compress
+    } else {
+        Invoke-WuoBootPreservation -Mode $Mode -JobPath $JobPath | ConvertTo-Json -Depth 6 -Compress
+    }
 }

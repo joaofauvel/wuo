@@ -80,6 +80,7 @@ def test_install_and_remove_tool_preserves_other_recovery_files(tmp_path: Path) 
     (system32 / "en-US/cmd.exe.mui").write_bytes(b"recovery cmd resources")
     (host / "certutil.exe").write_bytes(b"installed certutil")
     (host / "findstr.exe").write_bytes(b"installed findstr")
+    (host / "fc.exe").write_bytes(b"installed fc")
     (host / "choice.exe").write_bytes(b"installed choice")
     (host / "de-DE/findstr.exe.mui").write_bytes(b"installed findstr resources")
 
@@ -97,6 +98,7 @@ def test_install_and_remove_tool_preserves_other_recovery_files(tmp_path: Path) 
     assert (payload / "en-US/cmd.exe.mui").read_bytes() == b"recovery cmd resources"
     assert (payload / "certutil.exe").read_bytes() == b"installed certutil"
     assert (payload / "findstr.exe").read_bytes() == b"installed findstr"
+    assert (payload / "fc.exe").read_bytes() == b"installed fc"
     assert (payload / "choice.exe").read_bytes() == b"installed choice"
     assert (
         payload / "de-DE/findstr.exe.mui"

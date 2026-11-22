@@ -143,8 +143,19 @@ def render_feature_restore(
     receipt: bytes,
     *,
     preserve_boot_order: bool = False,
+    protected: bool = False,
+    hook_receipt_sha256: str = "",
 ) -> str:
     """Render recovery of a committed feature upgrade from its verified backup."""
+    if protected and not preserve_boot_order:
+        raise ValueError("Protected rollback requires the captured boot order.")
+    if protected and (
+        not fullmatch(r"[0-9a-f]{64}", hook_receipt_sha256)
+        or not fullmatch(r"[A-Za-z0-9]{1,80}", image.edition)
+    ):
+        raise ValueError(
+            "Protected rollback requires the captured offline hook receipt."
+        )
     saved = json.loads(receipt)
     machine = str(UUID(owner.machine_guid))
     job = str(UUID(job))
@@ -231,8 +242,12 @@ def render_feature_restore(
         "MACHINE": machine,
         "SOURCE_BUILD": str(owner.build),
         "SOURCE_UBR": hex(owner.revision),
-        "TARGET_BUILD": str(image.build),
-        "TARGET_UBR": hex(image.revision),
+        "REPLACEMENT_CHECK": "call :check_replacement || goto wrong_windows"
+        if protected
+        else (
+            f"call :load_identity {image.build} {hex(image.revision)} || goto wrong_windows\n"
+            "call :verify_pending || goto wrong_windows"
+        ),
         "WINDOWS": volumes["windows"],
         "EFI": volumes["efi"],
         "BACKUP": volumes["volume"],
@@ -245,9 +260,75 @@ def render_feature_restore(
         "RESTORE_BOOT_ORDER": (
             rf'(>"%WINDOWS%\ProgramData\WinOfflineUpdate\jobs\{job}\boot-rollback.id" echo {job})'
             " || echo Boot order restoration could not be queued. Review firmware setup after restarting."
-            if preserve_boot_order
+            if preserve_boot_order and not protected
             else ""
         ),
+        "PRE_SWAP_FAILURE": "protected_preswap" if protected else "wrong_windows",
+        "PROTECTED_REQUIREMENTS": 'if not exist "%TOOLS%fc.exe" goto invalid_catalog'
+        if protected
+        else "",
+        "RESUME_CHECK": (
+            'if exist "%SNAPSHOT%\\restore.done" goto interrupted\n'
+            'if exist "%SNAPSHOT%\\restore.started" (\n'
+            "    call :verify_restore_start || goto interrupted\n"
+            "    goto rollback_phase_verified\n"
+            ")"
+        )
+        if protected
+        else "",
+        "START_RESTORE": "call :start_restore || goto failed"
+        if protected
+        else (
+            'if exist "%SNAPSHOT%\\restore.started" goto interrupted\n'
+            f'(>"%SNAPSHOT%\\restore.started" echo {job}) || goto failed'
+        ),
+        "PRE_SWAP_BRANCH": (
+            "goto rollback_phase_verified\n:protected_preswap\n"
+            "call :check_preswap || goto wrong_windows\n"
+            ":rollback_phase_verified"
+            if protected
+            else ""
+        ),
+        "PROTECTED_QUEUE": "call :queue_boot_restore || goto failed"
+        if protected
+        else "",
+        "PROTECTED_SUBROUTINES": rf"""
+:verify_restore_start
+(>"%WORK%\expected-job.txt" echo {job}) || exit /b 1
+"%TOOLS%fc.exe" /b "%WORK%\expected-job.txt" "%SNAPSHOT%\restore.started" >nul 2>&1 || exit /b 1
+exit /b 0
+:start_restore
+if exist "%SNAPSHOT%\restore.started" goto verify_restore_start
+(>"%SNAPSHOT%\restore.start.tmp" echo {job}) || exit /b 1
+ren "%SNAPSHOT%\restore.start.tmp" restore.started || exit /b 1
+goto verify_restore_start
+:check_replacement
+call :load_identity {image.build} {hex(image.revision)} {image.edition} && call :verify_pending && exit /b 0
+set "VERIFY_ROOT=%WINDOWS%\ProgramData\WinOfflineUpdate\jobs\{job}"
+call :verify_file independent-hooks.done {hook_receipt_sha256} || exit /b 1
+set "VERIFY_ROOT=%WINDOWS%\Windows"
+call :load_identity {image.build} any {image.edition} || exit /b 1
+exit /b 0
+:check_preswap
+set "VERIFY_ROOT=%WINDOWS%\Windows"
+call :load_identity {owner.build} {hex(owner.revision)} || exit /b 1
+set "JOBROOT=%WINDOWS%\ProgramData\WinOfflineUpdate\jobs\{job}"
+if not exist "%TOOLS%fc.exe" exit /b 1
+(>"%WORK%\expected-job.txt" echo {job}) || exit /b 1
+"%TOOLS%fc.exe" /b "%WORK%\expected-job.txt" "%JOBROOT%\claimed.id" >nul 2>&1 || exit /b 1
+exit /b 0
+:queue_boot_restore
+set "JOBROOT=%WINDOWS%\ProgramData\WinOfflineUpdate\jobs\{job}"
+if not exist "%JOBROOT%\feature_upgrade.ps1" exit /b 1
+if not exist "%JOBROOT%\boot-order.json" exit /b 1
+if not exist "%TOOLS%fc.exe" exit /b 1
+(>"%WORK%\expected-job.txt" echo {job}) || exit /b 1
+copy /b /y "%WORK%\expected-job.txt" "%JOBROOT%\boot-rollback.id" >>"%LOG%" 2>&1 || exit /b 1
+"%TOOLS%fc.exe" /b "%WORK%\expected-job.txt" "%JOBROOT%\boot-rollback.id" >nul 2>&1 || exit /b 1
+exit /b 0
+"""
+        if protected
+        else "",
     }
     template = (
         files("wuo").joinpath("feature_restore.cmd.in").read_text(encoding="ascii")

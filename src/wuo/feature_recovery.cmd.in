@@ -1,0 +1,524 @@
+@echo off
+setlocal EnableExtensions DisableDelayedExpansion
+if /i not "%SystemRoot%"=="X:\Windows" exit /b 1
+if /i not "%~dp0"=="X:\Windows\System32\WUO\" exit /b 1
+if not "%~1"=="" if /i not "%~1"=="preflight" if /i not "%~1"=="check" if /i not "%~1"=="restore" exit /b 2
+set "RANDOM="
+set "ERRORLEVEL="
+set "SYS=%SystemRoot%\System32"
+set "TOOLS=%~dp0"
+set "WORK=%SystemRoot%\Temp\wuo-independent-%RANDOM%-%RANDOM%"
+set "RELATIVE_JOB=\ProgramData\WinOfflineUpdate\jobs\@@JOB@@"
+set "WINDOWS_VOLUME=@@WINDOWS_VOLUME@@"
+set "EFI_VOLUME=@@EFI_VOLUME@@"
+set "RECOVERY_EFI_VOLUME=@@RECOVERY_EFI_VOLUME@@"
+set "BACKUP_VOLUME=@@BACKUP_VOLUME@@"
+set "WINDOWS_ENTRY=@@WINDOWS_ENTRY@@"
+set "RECOVERY_ENTRY=@@RECOVERY_ENTRY@@"
+set "LETTERS=A B C D E F G H I J K L M N O P Q R S T U V W Y Z"
+set "MODE=%~1"
+set "TARGET="
+set "EFI="
+set "RECOVERY_EFI="
+set "BACKUP="
+set "TEMP_EFI="
+set "TEMP_RECOVERY_EFI="
+set "CONFLICT="
+set "LOG="
+set "CAN_CANCEL="
+set "FIRMWARE_UNCERTAIN="
+set "OWN_WORK="
+set "RESUMING="
+set "PREVIOUSLY_VERIFIED="
+set "PHASE=independent-post"
+set "HOOK_HIVE=HKLM\WUO_POST_@@JOB@@"
+set "ID_HIVE=HKLM\WUO_ID_@@JOB@@"
+
+set "STEP=verify the recovery tools"
+for %%F in (reg mountvol bcdedit wpeutil wbadmin robocopy) do if not exist "%SYS%\%%F.exe" goto stopped
+for %%F in (certutil findstr) do if not exist "%TOOLS%%%F.exe" goto stopped
+"%SYS%\reg.exe" query HKLM\SYSTEM\CurrentControlSet\Control\MiniNT >nul 2>&1 || goto stopped
+mkdir "%WORK%" >nul 2>&1 || goto stopped
+set "OWN_WORK=1"
+set "LOG=%WORK%\recovery.log"
+>"%WORK%\marker.txt" echo(@@JOB@@
+>"%WORK%\receipt.txt" echo(@@RECEIPT@@
+call :hash "%WORK%\marker.txt" || goto stopped
+set "MARKER_HASH=%HASH%"
+call :hash "%WORK%\receipt.txt" || goto stopped
+set "RECEIPT_HASH=%HASH%"
+
+set "STEP=locate one Windows volume with the exact job marker"
+for %%D in (%LETTERS%) do call :find_target %%D:
+if defined TARGET if not defined CONFLICT goto target_found
+if /i not "%MODE%"=="restore" if /i not "%MODE%"=="check" goto stopped
+set "TARGET="
+set "CONFLICT="
+set "RESUMING=1"
+set "STEP=locate the captured Windows volume for resuming rollback"
+for %%D in (%LETTERS%) do call :find_resume_target %%D:
+if not defined TARGET goto stopped
+if defined CONFLICT goto stopped
+goto target_volume
+
+:target_found
+set "JOB=%TARGET%%RELATIVE_JOB%"
+call :plain_dir "%TARGET%\ProgramData" || goto stopped
+call :plain_dir "%TARGET%\ProgramData\WinOfflineUpdate" || goto stopped
+call :plain_dir "%TARGET%\ProgramData\WinOfflineUpdate\jobs" || goto stopped
+call :plain_dir "%JOB%" || goto stopped
+
+:target_volume
+call :read_mount %TARGET% || goto stopped
+if /i not "%VOLUME%"=="%WINDOWS_VOLUME%" goto stopped
+set "STEP=open the independent recovery log"
+if not defined RESUMING call :persist_log || goto stopped
+
+set "STEP=locate the captured EFI and backup volumes"
+for %%D in (%LETTERS%) do call :find_volumes %%D:
+if defined CONFLICT goto stopped
+if not defined BACKUP goto stopped
+if not defined EFI call :attach_volume "%EFI_VOLUME%" TEMP_EFI EFI
+if not defined EFI goto stopped
+if not defined RECOVERY_EFI call :attach_volume "%RECOVERY_EFI_VOLUME%" TEMP_RECOVERY_EFI RECOVERY_EFI
+if not defined RECOVERY_EFI goto stopped
+set "BCD=%EFI%\EFI\Microsoft\Boot\BCD"
+set "SNAPSHOT=%BACKUP%\WUO-Rollback\@@JOB@@"
+set "STEP=verify the captured rollback packet, EFI files and Windows Backup catalog"
+call :verify_backup || goto stopped
+if defined RESUMING (
+    set "STEP=verify that this rollback was already started on the captured volume"
+    call :hash_is "%SNAPSHOT%\restore.started" %MARKER_HASH% || goto stopped
+)
+
+if /i "%MODE%"=="check" goto check_restore
+if /i "%MODE%"=="restore" goto manual_restore
+if /i "%MODE%"=="preflight" goto preflight
+if not exist "%JOB%\claimed.id" if not exist "%JOB%\safeos.ready" goto preflight
+
+set "STEP=verify the job's Setup handoff markers"
+call :hash_is "%JOB%\claimed.id" %MARKER_HASH% || goto stopped
+call :hash_is "%JOB%\safeos.ready" %MARKER_HASH% || goto stopped
+call :hash_is "%JOB%\precommit.done" %MARKER_HASH% || goto stopped
+call :hash_is "%JOB%\independent-preflight.done" %RECEIPT_HASH% || goto stopped
+if exist "%JOB%\precommit.failed" goto stopped
+if exist "%JOB%\independent-hooks.done" call :hash_is "%JOB%\independent-hooks.done" %RECEIPT_HASH% || goto stopped
+if exist "%JOB%\independent-hooks.done" set "PREVIOUSLY_VERIFIED=1"
+set "STEP=verify the retained original Windows and the replacement Windows build"
+call :plain_dir "%TARGET%\Windows.old" || goto stopped
+call :load_identity "%TARGET%\Windows.old\Windows" @@SOURCE_BUILD@@ @@SOURCE_REVISION@@ || goto stopped
+set "TARGET_REVISION=@@TARGET_REVISION@@"
+if defined PREVIOUSLY_VERIFIED set "TARGET_REVISION=any"
+call :load_identity "%TARGET%\Windows" @@TARGET_BUILD@@ %TARGET_REVISION% @@TARGET_EDITION@@ || goto stopped
+if not defined PREVIOUSLY_VERIFIED (
+    call :pending_setup || goto stopped
+)
+set "STEP=verify recovery-first firmware and the queued Windows loader"
+call :sync_firmware || goto stopped
+call :keep_recovery_first || goto stopped
+call :require_idle_firmware || goto stopped
+call :target_loader || goto stopped
+set "STEP=apply and verify the captured offline registry actions"
+call :apply_hooks || goto stopped
+set "STEP=write and read back the offline hook receipt"
+call :record_receipt "%JOB%\independent-hooks.done" || goto stopped
+goto release_windows
+
+:preflight
+set "STEP=verify the original unclaimed installation"
+if exist "%JOB%\claimed.id" goto stopped
+if exist "%JOB%\safeos.ready" goto stopped
+if exist "%JOB%\precommit.done" goto stopped
+call :load_identity "%TARGET%\Windows" @@SOURCE_BUILD@@ @@SOURCE_REVISION@@ || goto stopped
+set "STEP=verify both captured firmware entries"
+call :sync_firmware || goto stopped
+set "STEP=write and read back the independent recovery preflight receipt"
+call :record_receipt "%JOB%\independent-preflight.done" || goto stopped
+echo Independent recovery verified the original Windows, EFI and backup. Return to the original Windows to continue.
+goto success
+
+:check_restore
+set "STEP=check whether the post-swap Windows Backup restore applies"
+call "%WORK%\restore.cmd" check "%TOOLS%" || goto stopped
+goto success
+
+:manual_restore
+if exist "%SNAPSHOT%\restore.done" goto verify_prior_restore
+set "STEP=check whether the post-swap Windows Backup restore applies"
+call "%WORK%\restore.cmd" check "%TOOLS%" || goto stopped
+echo This restores the captured Windows volume and EFI files. Changes made since backup will be lost.
+set "CONFIRM="
+set /p "CONFIRM=Enter RESTORE to proceed: "
+setlocal EnableDelayedExpansion
+if not "!CONFIRM!"=="RESTORE" (
+    echo Restore cancelled.
+    endlocal
+    set "RESULT=1"
+    goto cleanup
+)
+endlocal
+set "STEP=verify recovery-first firmware before starting restore"
+call :sync_firmware || goto stopped
+call :keep_recovery_first || goto stopped
+call :require_idle_firmware || goto stopped
+set "STEP=restore the previous Windows and its EFI files"
+call "%WORK%\restore.cmd" apply "%TOOLS%" || goto stopped
+
+:verify_prior_restore
+set "STEP=verify restored Windows"
+call :hash_is "%SNAPSHOT%\restore.started" %MARKER_HASH% || goto stopped
+call :hash_is "%SNAPSHOT%\restore.done" %MARKER_HASH% || goto stopped
+call :load_identity "%TARGET%\Windows" @@SOURCE_BUILD@@ @@SOURCE_REVISION@@ || goto stopped
+call :sync_firmware || goto stopped
+call :keep_recovery_first || goto stopped
+
+:release_windows
+set "STEP=verify the same firmware recovery and Windows entries before reboot"
+call :sync_firmware || goto stopped
+call :require_idle_firmware || goto stopped
+call :target_loader || goto stopped
+set "STEP=write and verify the one-time Windows firmware selection"
+set "CAN_CANCEL=1"
+"%SYS%\bcdedit.exe" /set {fwbootmgr} bootsequence %WINDOWS_ENTRY% >>"%LOG%" 2>&1 || goto stopped
+call :firmware_order || goto stopped
+if /i not "%SEQUENCE%"=="%WINDOWS_ENTRY%" goto stopped
+set "STEP=reboot into the verified Windows installation"
+"%SYS%\wpeutil.exe" reboot || goto stopped
+goto success
+
+:find_target
+set "MARKER=%~1%RELATIVE_JOB%\target.id"
+if not exist "%MARKER%" exit /b 0
+if defined TARGET set "CONFLICT=1"
+call :hash_is "%MARKER%" %MARKER_HASH% || set "CONFLICT=1"
+set "TARGET=%~1"
+exit /b 0
+
+:find_resume_target
+call :read_mount %~1 || exit /b 0
+if /i not "%VOLUME%"=="%WINDOWS_VOLUME%" exit /b 0
+if defined TARGET set "CONFLICT=1"
+set "TARGET=%~1"
+exit /b 0
+
+:persist_log
+if exist "%JOB%\independent-recovery.log" call :plain_file "%JOB%\independent-recovery.log" || exit /b 1
+>>"%JOB%\independent-recovery.log" echo Verified the Windows volume and job marker. || exit /b 1
+set "LOG=%JOB%\independent-recovery.log"
+exit /b 0
+
+:find_volumes
+call :read_mount %~1 || exit /b 0
+if /i "%VOLUME%"=="%EFI_VOLUME%" (
+    if defined EFI set "CONFLICT=1"
+    set "EFI=%~1"
+)
+if /i "%VOLUME%"=="%RECOVERY_EFI_VOLUME%" (
+    if defined RECOVERY_EFI set "CONFLICT=1"
+    set "RECOVERY_EFI=%~1"
+)
+if /i "%VOLUME%"=="%BACKUP_VOLUME%" (
+    if defined BACKUP set "CONFLICT=1"
+    set "BACKUP=%~1"
+)
+exit /b 0
+
+:read_mount
+set "VOLUME="
+"%SYS%\mountvol.exe" %~1\ /L >"%WORK%\mount.txt" 2>nul || exit /b 1
+for /f "usebackq tokens=1" %%V in ("%WORK%\mount.txt") do set "VOLUME=%%V"
+if not defined VOLUME exit /b 1
+exit /b 0
+
+:attach_volume
+set "ATTACHED="
+for %%D in (Z Y W V U T S R Q P O N M L K J I H G F) do if not defined ATTACHED call :mount_volume %%D: "%~1"
+if not defined ATTACHED exit /b 1
+set "%~2=%ATTACHED%"
+call :read_mount %ATTACHED% || exit /b 1
+if /i not "%VOLUME%"=="%~1" exit /b 1
+set "%~3=%ATTACHED%"
+exit /b 0
+
+:mount_volume
+if exist "%~1\" exit /b 1
+"%SYS%\mountvol.exe" %~1\ %~2 >nul 2>&1 || exit /b 1
+set "ATTACHED=%~1"
+exit /b 0
+
+:verify_backup
+call :plain_dir "%BACKUP%\WUO-Rollback" || exit /b 1
+call :plain_dir "%SNAPSHOT%" || exit /b 1
+call :plain_dir "%SNAPSHOT%\recovery" || exit /b 1
+call :hash_is "%SNAPSHOT%\rollback.json" @@ROLLBACK_HASH@@ || exit /b 1
+call :plain_file "%SNAPSHOT%\recovery\restore.cmd" || exit /b 1
+copy /b "%SNAPSHOT%\recovery\restore.cmd" "%WORK%\restore.cmd" >nul || exit /b 1
+call :hash_is "%WORK%\restore.cmd" @@RESTORE_HASH@@ || exit /b 1
+call "%WORK%\restore.cmd" check_backup "%TOOLS%" >>"%LOG%" 2>&1
+exit /b
+
+:load_identity
+call :config_path "%~1" || exit /b 1
+call :plain_file "%~1\System32\Config\SOFTWARE" || exit /b 1
+"%SYS%\reg.exe" load "%ID_HIVE%" "%~1\System32\Config\SOFTWARE" >>"%LOG%" 2>&1 || exit /b 1
+call :verify_identity %~2 %~3 %~4
+set "VERIFY_EXIT=%ERRORLEVEL%"
+"%SYS%\reg.exe" unload "%ID_HIVE%" >>"%LOG%" 2>&1 || exit /b 1
+exit /b %VERIFY_EXIT%
+
+:config_path
+call :plain_dir "%~1" || exit /b 1
+call :plain_dir "%~1\System32" || exit /b 1
+call :plain_dir "%~1\System32\Config" || exit /b 1
+exit /b 0
+
+:verify_identity
+call :reg_value "%ID_HIVE%\Microsoft\Cryptography" MachineGuid REG_SZ @@MACHINE@@ || exit /b 1
+set "KEY=%ID_HIVE%\Microsoft\Windows NT\CurrentVersion"
+call :reg_value "%KEY%" CurrentBuildNumber REG_SZ %~1 || exit /b 1
+if /i not "%~2"=="any" call :reg_value "%KEY%" UBR REG_DWORD %~2 || exit /b 1
+if not "%~3"=="" call :reg_value "%KEY%" EditionID REG_SZ %~3 || exit /b 1
+exit /b 0
+
+:pending_setup
+call :plain_file "%TARGET%\Windows\System32\Config\SYSTEM" || exit /b 1
+"%SYS%\reg.exe" load "%ID_HIVE%" "%TARGET%\Windows\System32\Config\SYSTEM" >>"%LOG%" 2>&1 || exit /b 1
+call :reg_value "%ID_HIVE%\Setup" SystemSetupInProgress REG_DWORD 0x1
+set "VERIFY_EXIT=%ERRORLEVEL%"
+"%SYS%\reg.exe" unload "%ID_HIVE%" >>"%LOG%" 2>&1 || exit /b 1
+exit /b %VERIFY_EXIT%
+
+:reg_value
+"%SYS%\reg.exe" query "%~1" /v "%~2" >"%WORK%\value.txt" 2>>"%LOG%" || exit /b 1
+for /f "usebackq tokens=1,2,*" %%A in ("%WORK%\value.txt") do if /i "%%A"=="%~2" if /i "%%B"=="%~3" if /i "%%C"=="%~4" exit /b 0
+exit /b 1
+
+:sync_firmware
+call :plain_dir "%EFI%\EFI" || exit /b 1
+call :plain_dir "%EFI%\EFI\Microsoft" || exit /b 1
+call :plain_dir "%EFI%\EFI\Microsoft\Boot" || exit /b 1
+call :plain_file "%EFI%\EFI\Microsoft\Boot\bootmgfw.efi" || exit /b 1
+call :plain_file "%BCD%" || exit /b 1
+"%SYS%\bcdedit.exe" /sysstore %EFI% >>"%LOG%" 2>&1 || exit /b 1
+"%SYS%\bcdedit.exe" /enum firmware /v >"%WORK%\firmware.txt" 2>>"%LOG%" || exit /b 1
+"%TOOLS%findstr.exe" /i /r /x /c:"identifier  *%RECOVERY_ENTRY%" "%WORK%\firmware.txt" >nul || exit /b 1
+"%TOOLS%findstr.exe" /i /r /x /c:"identifier  *%WINDOWS_ENTRY%" "%WORK%\firmware.txt" >nul || exit /b 1
+"%SYS%\bcdedit.exe" /enum %RECOVERY_ENTRY% /v >"%WORK%\bcd.txt" 2>>"%LOG%" || exit /b 1
+call :bcd_value identifier %RECOVERY_ENTRY% || exit /b 1
+call :bcd_value device "partition=%RECOVERY_EFI%" || exit /b 1
+call :bcd_value path "@@RECOVERY_PATH@@" || exit /b 1
+call :hash_is "%RECOVERY_EFI%@@RECOVERY_PATH@@" @@RECOVERY_LOADER_HASH@@ || exit /b 1
+"%SYS%\bcdedit.exe" /enum %WINDOWS_ENTRY% /v >"%WORK%\bcd.txt" 2>>"%LOG%" || exit /b 1
+call :bcd_value identifier %WINDOWS_ENTRY% || exit /b 1
+call :bcd_value device "partition=%EFI%" || exit /b 1
+call :bcd_value path "\EFI\Microsoft\Boot\bootmgfw.efi" || exit /b 1
+exit /b 0
+
+:keep_recovery_first
+"%SYS%\bcdedit.exe" /enum {fwbootmgr} /v >"%WORK%\bcd.txt" 2>>"%LOG%" || exit /b 1
+if /i not "%MODE%"=="restore" if not exist "%JOB%\safeos.ready" exit /b 1
+call :bcd_value displayorder %RECOVERY_ENTRY% && exit /b 0
+call :read_sequence || exit /b 1
+if defined SEQUENCE exit /b 1
+"%SYS%\bcdedit.exe" /set {fwbootmgr} displayorder %RECOVERY_ENTRY% /addfirst >>"%LOG%" 2>&1 || exit /b 1
+call :firmware_order
+exit /b
+
+:firmware_order
+"%SYS%\bcdedit.exe" /enum {fwbootmgr} /v >"%WORK%\bcd.txt" 2>>"%LOG%" || exit /b 1
+call :bcd_value displayorder %RECOVERY_ENTRY% || exit /b 1
+call :read_sequence
+exit /b
+
+:require_idle_firmware
+call :firmware_order || (
+    set "FIRMWARE_UNCERTAIN=1"
+    exit /b 1
+)
+if not defined SEQUENCE exit /b 0
+if /i "%SEQUENCE%"=="%WINDOWS_ENTRY%" (
+    set "CAN_CANCEL=1"
+) else (
+    set "FIRMWARE_UNCERTAIN=1"
+)
+exit /b 1
+
+:cancel_windows_boot
+"%SYS%\bcdedit.exe" /enum {fwbootmgr} /v >"%WORK%\bcd.txt" 2>>"%LOG%" || exit /b 1
+call :read_sequence || exit /b 1
+if defined SEQUENCE (
+    if /i not "%SEQUENCE%"=="%WINDOWS_ENTRY%" exit /b 1
+    "%SYS%\bcdedit.exe" /deletevalue {fwbootmgr} bootsequence >>"%LOG%" 2>&1 || exit /b 1
+)
+call :firmware_order || exit /b 1
+if defined SEQUENCE exit /b 1
+exit /b 0
+
+:target_loader
+"%SYS%\bcdedit.exe" /store "%BCD%" /enum {bootmgr} /v >"%WORK%\bcd.txt" 2>>"%LOG%" || exit /b 1
+call :read_sequence || exit /b 1
+if not defined SEQUENCE call :bcd_field default
+if not defined SEQUENCE call :guid_value FIELD SEQUENCE || exit /b 1
+"%SYS%\bcdedit.exe" /store "%BCD%" /enum %SEQUENCE% /v >"%WORK%\bcd.txt" 2>>"%LOG%" || exit /b 1
+call :bcd_value identifier %SEQUENCE% || exit /b 1
+call :bcd_value device "partition=%TARGET%" || exit /b 1
+call :bcd_value osdevice "partition=%TARGET%" || exit /b 1
+call :bcd_value path "\Windows\System32\winload.efi" || exit /b 1
+call :bcd_value systemroot "\Windows" || exit /b 1
+call :bcd_field winpe
+setlocal EnableDelayedExpansion
+if defined FIELD if /i not "!FIELD!"=="No" exit /b 1
+exit /b 0
+
+:bcd_field
+set "FIELD="
+for /f "usebackq tokens=1,*" %%A in ("%WORK%\bcd.txt") do if /i "%%A"=="%~1" if not defined FIELD set "FIELD=%%B"
+exit /b 0
+
+:bcd_value
+call :bcd_field %~1
+setlocal EnableDelayedExpansion
+if /i "!FIELD!"=="%~2" exit /b 0
+exit /b 1
+
+:read_sequence
+set "SEQUENCE="
+set "FIELD="
+set "SEQUENCE_LINE="
+set "SEQUENCE_SEEN="
+for /f "usebackq tokens=1,*" %%A in ("%WORK%\bcd.txt") do (
+    if defined SEQUENCE_LINE (
+        if "%%B"=="" exit /b 1
+        set "SEQUENCE_LINE="
+    )
+    if /i "%%A"=="bootsequence" (
+        if defined SEQUENCE_SEEN exit /b 1
+        if "%%B"=="" exit /b 1
+        set "FIELD=%%B"
+        set "SEQUENCE_LINE=1"
+        set "SEQUENCE_SEEN=1"
+    )
+)
+if not defined SEQUENCE_SEEN exit /b 0
+call :guid_value FIELD SEQUENCE
+exit /b
+
+:guid_value
+setlocal EnableDelayedExpansion
+set "GUID=!%~1!"
+if not "!GUID:~0,1!!GUID:~9,1!!GUID:~14,1!!GUID:~19,1!!GUID:~24,1!!GUID:~37,1!"=="{----}" exit /b 1
+if not "!GUID:~38,1!"=="" exit /b 1
+>"%WORK%\guid.txt" echo(!GUID!
+"%TOOLS%findstr.exe" /i /r /x /c:"{[0-9a-f][0-9a-f-]*}" "%WORK%\guid.txt" >nul || exit /b 1
+endlocal & set "%~2=%GUID%"
+exit /b 0
+
+:record_receipt
+if exist "%~1" (
+    call :hash_is "%~1" %RECEIPT_HASH%
+    exit /b
+)
+set "DRAFT=%~1.%RANDOM%-%RANDOM%.tmp"
+if exist "%DRAFT%" exit /b 1
+copy /b "%WORK%\receipt.txt" "%DRAFT%" >nul || exit /b 1
+call :hash_is "%DRAFT%" %RECEIPT_HASH% || exit /b 1
+ren "%DRAFT%" "%~nx1" || exit /b 1
+call :hash_is "%~1" %RECEIPT_HASH%
+exit /b
+
+:plain_dir
+call :attributes "%~1" || exit /b 1
+if "%ATTR:d=%"=="%ATTR%" exit /b 1
+exit /b 0
+
+:plain_file
+call :attributes "%~1" || exit /b 1
+if not "%ATTR:d=%"=="%ATTR%" exit /b 1
+exit /b 0
+
+:attributes
+set "ATTR="
+for %%F in ("%~1") do set "ATTR=%%~aF"
+if not defined ATTR exit /b 1
+if not "%ATTR:l=%"=="%ATTR%" exit /b 1
+exit /b 0
+
+:hash
+set "HASH="
+call :plain_file "%~1" || exit /b 1
+"%TOOLS%certutil.exe" -hashfile "%~1" SHA256 >"%WORK%\hash.raw" 2>&1 || exit /b 1
+"%TOOLS%findstr.exe" /i /r /x /c:"[0-9a-f][0-9a-f]*" "%WORK%\hash.raw" >"%WORK%\hash.txt" || exit /b 1
+set /p "HASH="<"%WORK%\hash.txt" || exit /b 1
+if "%HASH:~63,1%"=="" exit /b 1
+if not "%HASH:~64,1%"=="" exit /b 1
+exit /b 0
+
+:hash_is
+call :hash "%~1" || exit /b 1
+if /i not "%HASH%"=="%~2" exit /b 1
+exit /b 0
+
+:apply_hooks
+call :plain_file "%TARGET%\Windows\System32\Config\SYSTEM" || exit /b 1
+call :open_hook_hive || exit /b 1
+call :captured_hooks inspect || goto hook_failed
+call :captured_hooks write || goto hook_failed
+call :verify_control_set || goto hook_failed
+call :captured_hooks verify || goto hook_failed
+"%SYS%\reg.exe" unload "%HOOK_HIVE%" >>"%LOG%" 2>&1 || exit /b 1
+exit /b 0
+
+:captured_hooks
+@@CAPTURED_HOOKS@@
+exit /b 0
+
+:verify_control_set
+set "HOOK_KEY=%HOOK_HIVE%\Select"
+set "HOOK_NAME=Default"
+call :read_hook || exit /b 1
+set /a "CURRENT_CS=ACTUAL" >nul 2>&1 || exit /b 1
+set "CURRENT_CS=00%CURRENT_CS%"
+if not "%CURRENT_CS:~-3%"=="%CS%" exit /b 1
+exit /b 0
+
+:verify_hook
+call :read_hook || exit /b 1
+if /i not "%ACTUAL%"=="%HOOK_NEW%" exit /b 1
+>>"%LOG%" echo Verified "%HOOK_KEY%" /v "%HOOK_NAME%" equals %ACTUAL%.
+exit /b 0
+
+@@HOOK_HELPERS@@
+
+:stopped
+if defined CAN_CANCEL (
+    call :cancel_windows_boot || set "FIRMWARE_UNCERTAIN=1"
+)
+echo Independent recovery stopped. Could not %STEP%.
+if defined LOG >>"%LOG%" echo Independent recovery stopped. Could not %STEP%.
+if defined FIRMWARE_UNCERTAIN echo The one-time firmware selection is unresolved. Stay in recovery.
+if defined LOG if /i "%LOG%"=="%WORK%\recovery.log" type "%LOG%"
+if defined LOG if /i not "%LOG%"=="%WORK%\recovery.log" echo Recovery log "%LOG%"
+echo Windows Setup logs are in the Panther and Rollback folders under $WINDOWS.~BT\Sources.
+echo For a post-swap backup check, run "%~f0" check
+echo To restore the previous Windows and EFI after a successful check, run "%~f0" restore
+echo For a pre-swap failure, keep this recovery media available and inspect the original Windows and EFI before resuming.
+set "RESULT=1"
+goto cleanup
+
+:success
+set "RESULT=0"
+
+:cleanup
+if defined TEMP_RECOVERY_EFI call :unmount_volume %TEMP_RECOVERY_EFI% "%RECOVERY_EFI_VOLUME%"
+if defined TEMP_EFI call :unmount_volume %TEMP_EFI% "%EFI_VOLUME%"
+if defined OWN_WORK (
+    del /q "%WORK%\*" >nul 2>&1
+    rmdir "%WORK%" >nul 2>&1
+)
+exit /b %RESULT%
+
+:unmount_volume
+call :read_mount %~1 || exit /b 1
+if /i not "%VOLUME%"=="%~2" exit /b 1
+"%SYS%\mountvol.exe" %~1\ /D >nul 2>&1
+exit /b

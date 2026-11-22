@@ -111,15 +111,18 @@ def test_windows_scheduler_stores_the_full_feature_task_command(tmp_path: Path) 
 
 
 @pytest.mark.parametrize("backup_fails", [False, True])
-@pytest.mark.parametrize("preserve_boot", [False, True])
+@pytest.mark.parametrize(
+    ("preserve_boot", "protected"), [(False, False), (True, False), (True, True)]
+)
 def test_feature_is_published_only_after_backup_and_deferred_setup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     backup_fails: bool,
     preserve_boot: bool,
+    protected: bool,
 ) -> None:
     from wuo import feature_upgrade
-    from wuo.winre_menu import Menu
+    from wuo.winre_menu import Menu, _require_captured_feature_hook_support
 
     identity = TargetIdentity(
         "25H2", 26200, 9974, "x64", tmp_path / "Windows", OWNER, LOADER
@@ -128,18 +131,24 @@ def test_feature_is_published_only_after_backup_and_deferred_setup(
     menu.root.mkdir(parents=True)
     menu.job_state(JOB).parent.mkdir()
     (menu.root / "installed.id").write_text(f"{OWNER}\n", encoding="ascii")
-    (menu.root / "feature-menu.version").write_bytes(b"2\r\n")
+    (menu.root / "feature-menu.version").write_bytes(
+        b"3\r\n" if protected else b"2\r\n"
+    )
     iso = tmp_path / "Windows.iso"
     iso.touch()
     media = feature_upgrade.FeatureMedia(
-        iso, "ab" * 32, rollback=True, preserve_boot_order=preserve_boot
+        iso,
+        "ab" * 32,
+        rollback=True,
+        preserve_boot_order=preserve_boot,
+        recovery_drive="F:" if protected else None,
     )
     image = feature_upgrade.FeatureImage(1, 26300, 9500, "Core", "x64", "en-US")
     events: list[str] = []
     backup_root = tmp_path / "backup"
     system32 = identity.windows / "System32"
     system32.mkdir(parents=True)
-    for name in ("certutil.exe", "findstr.exe"):
+    for name in ("certutil.exe", "findstr.exe", "fc.exe"):
         (system32 / name).write_bytes(name.encode("ascii"))
 
     def capture(_target: object, mode: str, job: Path) -> dict[str, object]:
@@ -177,6 +186,7 @@ def test_feature_is_published_only_after_backup_and_deferred_setup(
         return receipt, snapshot
 
     def prepare(*_args: object) -> None:
+        assert not protected
         assert not (menu.root / "pending.id").exists()
         assert not list(menu.job_state(JOB).parent.glob("*/feature.ready"))
         (portable,) = backup_root.glob("*/recovery")
@@ -184,7 +194,7 @@ def test_feature_is_published_only_after_backup_and_deferred_setup(
         assert (portable / "restore.cmd").read_bytes() == (
             job / "restore.cmd"
         ).read_bytes()
-        for name in ("certutil.exe", "findstr.exe"):
+        for name in ("certutil.exe", "findstr.exe", "fc.exe"):
             assert (portable / name).read_bytes() == (system32 / name).read_bytes()
         if preserve_boot:
             request = json.loads((job / "feature.json").read_bytes())
@@ -199,6 +209,29 @@ def test_feature_is_published_only_after_backup_and_deferred_setup(
             assert "boot-rollback.id" in (job / "restore.cmd").read_text()
         events.append("prepare")
 
+    def select(_target: object, drive: str, backup: str) -> dict[str, object]:
+        assert drive == "F:" and backup == "E:"
+        events.append("identify")
+        return {"id": "Boot0001"}
+
+    def prepare_recovery(
+        _target: object,
+        _media: object,
+        _image: object,
+        job: Path,
+        _hooks: object,
+        selection: dict[str, object],
+        receipt: bytes,
+    ) -> dict[str, object]:
+        assert protected and selection["id"] == "Boot0001"
+        assert not (menu.root / "pending.id").exists()
+        assert not (job / "feature.ready").exists()
+        assert not (system32 / "update" / "runonce" / job.name).exists()
+        assert receipt == (job / "rollback.json").read_bytes()
+        assert (backup_root / job.name / "recovery" / "restore.cmd").is_file()
+        events.append("prepare-recovery")
+        return {"receipt": f"v1 {job.name} {'f' * 64} 26300"}
+
     def schedule(_job: str, continuation: Path) -> None:
         assert continuation.is_file()
         assert not (menu.root / "pending.id").exists()
@@ -209,8 +242,14 @@ def test_feature_is_published_only_after_backup_and_deferred_setup(
     monkeypatch.setattr(feature_upgrade, "backup_feature", backup)
     monkeypatch.setattr(feature_upgrade, "prepare_media", prepare)
     monkeypatch.setattr(feature_upgrade, "feature_boot", capture, raising=False)
+    monkeypatch.setattr(feature_upgrade, "feature_recovery_selection", select)
+    monkeypatch.setattr(
+        feature_upgrade, "prepare_independent_recovery", prepare_recovery
+    )
     monkeypatch.setattr(menu, "_register_feature_task", schedule)
-    capture_events = ["capture", "schedule"] if preserve_boot else []
+    capture_events = (["identify"] if protected else []) + (
+        ["capture", "schedule"] if preserve_boot else []
+    )
     if backup_fails:
         with pytest.raises(ValueError, match="backup failed"):
             menu.stage_feature(media, image, None, backup_drive="E:")
@@ -221,7 +260,7 @@ def test_feature_is_published_only_after_backup_and_deferred_setup(
         assert events == [
             *capture_events,
             "backup",
-            "prepare",
+            "prepare-recovery" if protected else "prepare",
             *([] if preserve_boot else ["schedule"]),
         ]
         marker = f"{job.name}\r\n".encode("ascii")
@@ -231,6 +270,17 @@ def test_feature_is_published_only_after_backup_and_deferred_setup(
         assert (job / "restore.sha256").read_text().strip() == package_hashes(
             job / "restore.cmd"
         )[0]
+        if protected:
+            assert (job / "feature.protected").read_bytes() == marker
+            request = json.loads((job / "feature.json").read_bytes())
+            assert request["schema"] == 2
+            proof = job / "independent-preflight.done"
+            with pytest.raises(
+                ValueError, match="Ventoy drive and wait for its preflight"
+            ):
+                _require_captured_feature_hook_support(job)
+            proof.write_bytes(f"{request['recovery']['receipt']}\r\n".encode("ascii"))
+            _require_captured_feature_hook_support(job)
 
 
 @pytest.mark.parametrize(

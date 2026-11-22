@@ -149,8 +149,8 @@ To remove the recovery menu entry, run `wuo remove` in an administrator PowerShe
   and independently checked; a restart requirement stops the next phase.
 - **Feature updates.** Standalone CBS enablement packages can use recovery
   servicing. Full Windows Setup upgrades appear in the scan. See the
-  [feature-upgrade compatibility preview](docs/feature-upgrades.md) for
-  checking downloaded installation media.
+  [feature-upgrade instructions](docs/feature-upgrades.md) for checking an ISO
+  and using the protected recovery handoff.
 - **Other installers.** Downloading a package does not count as installing it.
   Offers without a supported installation route are listed with their files and
   remain incomplete.

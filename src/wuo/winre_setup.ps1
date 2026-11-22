@@ -324,14 +324,14 @@ function Edit-RecoveryTools(
             throw 'The custom recovery tool is missing or belongs to another installation.'
         }
         # A serviced WIM can contain other tools. Only remove our own files.
-        foreach ($name in 'launcher.cmd', 'owner.id', 'cmd.exe', 'certutil.exe', 'findstr.exe', 'choice.exe') {
+        foreach ($name in 'launcher.cmd', 'owner.id', 'cmd.exe', 'certutil.exe', 'findstr.exe', 'fc.exe', 'choice.exe') {
             $file = Join-Path $payload $name
             if (Test-PlainPath $file -AllowImageBacking) { [IO.File]::Delete($file) }
         }
         foreach ($locale in Get-ChildItem -LiteralPath $payload -Directory) {
             if ($locale.Name -notmatch '^[a-z]{2,3}(?:-[a-z0-9]{2,8})+$') { continue }
             $null = Test-PlainPath $locale.FullName -Directory
-            foreach ($name in 'cmd.exe.mui', 'certutil.exe.mui', 'findstr.exe.mui', 'choice.exe.mui') {
+            foreach ($name in 'cmd.exe.mui', 'certutil.exe.mui', 'findstr.exe.mui', 'fc.exe.mui', 'choice.exe.mui') {
                 $file = Join-Path $locale.FullName $name
                 if (Test-PlainPath $file -AllowImageBacking) { [IO.File]::Delete($file) }
             }
@@ -349,6 +349,7 @@ function Edit-RecoveryTools(
     Copy-RecoveryCommand (Join-Path $Mount 'Windows\System32') 'cmd.exe' $payload
     Copy-RecoveryCommand $HostSystem32 'certutil.exe' $payload
     Copy-RecoveryCommand $HostSystem32 'findstr.exe' $payload
+    Copy-RecoveryCommand $HostSystem32 'fc.exe' $payload
     Copy-RecoveryCommand $HostSystem32 'choice.exe' $payload
     [IO.File]::WriteAllText((Join-Path $payload 'launcher.cmd'), $LauncherText, $ascii)
     [IO.File]::WriteAllText($owner, ($MachineGuid + [Environment]::NewLine), $ascii)

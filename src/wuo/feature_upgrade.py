@@ -33,6 +33,7 @@ class FeatureMedia:
     sha256: str
     rollback: bool = False
     preserve_boot_order: bool = False
+    recovery_drive: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,11 +58,16 @@ def feature_setup_assets(
         raise ValueError("Supply the ISO's Microsoft-published SHA-256 digest.")
     if image.architecture != identity.architecture:
         raise ValueError("The verified image does not match the running architecture.")
+    protected = media.recovery_drive is not None
+    if protected and not (media.rollback and media.preserve_boot_order):
+        raise ValueError(
+            "Protected feature upgrades require backup and boot preservation."
+        )
     callback = render_feature_precommit(
-        str(job), identity, image, hooks, rollback=media.rollback
+        str(job), identity, image, () if protected else hooks, rollback=media.rollback
     ).encode("ascii")
     request = {
-        "schema": 1,
+        "schema": 2 if protected else 1,
         "id": str(job),
         "machine": str(UUID(identity.machine_guid)),
         "source": f"{identity.build}.{identity.revision}",
@@ -72,6 +78,42 @@ def feature_setup_assets(
         "rollback": media.rollback,
     }
     return json.dumps(request, sort_keys=True).encode("ascii"), callback
+
+
+def render_feature_safeos(
+    job: UUID,
+    windows_volume: str,
+    efi_volume: str,
+    recovery_entry: str,
+    loader: str,
+    recovery_efi_volume: str,
+) -> bytes:
+    volume = re.compile(
+        r"\\\\\?\\Volume\{[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\}\\", re.I
+    )
+    volumes = {
+        path.lower() for path in (windows_volume, efi_volume, recovery_efi_volume)
+    }
+    if len(volumes) != 3 or any(not volume.fullmatch(path) for path in volumes):
+        raise ValueError(
+            "The SafeOS gate requires distinct Windows and EFI volume identifiers."
+        )
+    if not re.fullmatch(r"\\EFI\\Boot\\boot(?:x64|aa64)\.efi", loader, re.I):
+        raise ValueError("The SafeOS gate requires a verified removable EFI loader.")
+    guid = str(UUID(recovery_entry.strip("{}")))
+    if recovery_entry.lower() != f"{{{guid}}}":
+        raise ValueError("Invalid recovery firmware application ID.")
+    script = files("wuo").joinpath("feature_safeos.cmd.in").read_text(encoding="ascii")
+    for key, value in {
+        "JOB": str(job),
+        "WINDOWS": windows_volume,
+        "EFI": efi_volume,
+        "RECOVERY_EFI": recovery_efi_volume,
+        "RECOVERY": recovery_entry.lower(),
+        "LOADER": loader,
+    }.items():
+        script = script.replace(f"@@{key}@@", value)
+    return script.replace("\n", "\r\n").encode("ascii")
 
 
 def offered_release(offer: Offer, identity: TargetIdentity) -> str | None:
@@ -286,6 +328,124 @@ def feature_boot(
     return report
 
 
+def feature_recovery_selection(
+    identity: TargetIdentity, recovery_drive: str, backup_drive: str
+) -> dict[str, object]:
+    for drive in (recovery_drive, backup_drive):
+        if not re.fullmatch(r"[A-Z]:", drive, re.I):
+            raise ValueError(
+                "Specify the Ventoy and backup drive letters as E: and D:."
+            )
+    report = json.loads(
+        _run_native(
+            identity,
+            "feature_boot.ps1",
+            "independent recovery discovery",
+            [
+                "-Mode",
+                "Recovery",
+                "-RecoveryDrive",
+                recovery_drive.upper(),
+                "-BackupDrive",
+                backup_drive.upper(),
+            ],
+            {},
+        )
+    )
+    if (
+        not isinstance(report, dict)
+        or report.get("schema") != 1
+        or not isinstance(report.get("windows_entry"), dict)
+        or any(
+            not isinstance(report.get(key), str)
+            for key in (
+                "id",
+                "identity",
+                "bcd_id",
+                "loader",
+                "loader_sha256",
+                "efi",
+                "efi_volume",
+                "media",
+                "media_volume",
+            )
+        )
+    ):
+        raise ValueError(
+            "The independent firmware recovery entry could not be verified."
+        )
+    return report
+
+
+def prepare_independent_recovery(
+    identity: TargetIdentity,
+    media: FeatureMedia,
+    image: FeatureImage,
+    job: Path,
+    hooks: tuple[Hook, ...],
+    selection: dict[str, object],
+    rollback: bytes,
+) -> dict[str, object]:
+    from .feature_media import build_recovery_iso
+    from .feature_recovery import feature_recovery_receipt, render_feature_recovery
+    from .feature_ventoy import deploy_recovery_iso
+
+    if image.architecture != "x64" or image.language.lower() != "en-us":
+        raise ValueError(
+            "The protected recovery image currently requires x64 en-US media."
+        )
+    job_id = UUID(job.name)
+    volumes = json.loads(rollback)
+    restore = job / "restore.cmd"
+    receipt = feature_recovery_receipt(job_id, image, hooks)
+    runner = render_feature_recovery(
+        job_id,
+        identity,
+        image,
+        hooks,
+        windows_volume=volumes["windows"],
+        efi_volume=volumes["efi"],
+        backup_volume=volumes["volume"],
+        recovery_entry=str(selection["bcd_id"]),
+        recovery_path=str(selection["loader"]),
+        recovery_efi_volume=str(selection["efi_volume"]),
+        recovery_loader_sha256=str(selection["loader_sha256"]),
+        restore_sha256=sha256(restore.read_bytes()).hexdigest(),
+        rollback_sha256=sha256(rollback).hexdigest(),
+    )
+    wrapper = render_feature_safeos(
+        job_id,
+        volumes["windows"],
+        volumes["efi"],
+        str(selection["bcd_id"]),
+        str(selection["loader"]),
+        str(selection["efi_volume"]),
+    )
+    helper = files("wuo").joinpath("feature_safeos.ps1").read_bytes()
+    (job / "feature_safeos.ps1").write_bytes(helper)
+    (job / "feature_safeos.cmd").write_bytes(wrapper)
+    (job / "independent-preflight.sha256").write_bytes(
+        (sha256(receipt).hexdigest() + "\r\n").encode("ascii")
+    )
+    local_iso = job / "feature-recovery.iso"
+    digest = build_recovery_iso(
+        media.iso, media.sha256, local_iso, {"start.cmd": runner}, index=image.index
+    )
+    deployment = job / "ventoy-state.json"
+    deploy_recovery_iso(
+        Path(str(selection["media_volume"])), local_iso, digest, job_id, deployment
+    )
+    ventoy = json.loads(deployment.read_bytes())
+    return {
+        "entry": selection,
+        "receipt": receipt.decode("ascii").removesuffix("\r\n"),
+        "iso_sha256": digest,
+        "config_sha256": ventoy["config_sha256"],
+        "helper_sha256": sha256(helper).hexdigest(),
+        "wrapper_sha256": sha256(wrapper).hexdigest(),
+    }
+
+
 def backup_feature(
     identity: TargetIdentity, job: UUID, drive: str
 ) -> tuple[bytes, Path]:
@@ -331,9 +491,13 @@ def backup_feature(
         )
     ):
         raise ValueError("The native feature backup returned an invalid receipt.")
-    return json.dumps(report, sort_keys=True).encode("ascii"), Path(
-        volume
-    ) / "WUO-Rollback" / str(job)
+    snapshot = Path(volume) / "WUO-Rollback" / str(job)
+    receipt = (snapshot / "rollback.json").read_bytes()
+    if json.loads(receipt) != report:
+        raise ValueError(
+            "The saved feature backup receipt does not match the verified catalog."
+        )
+    return receipt, snapshot
 
 
 def _scan_media(

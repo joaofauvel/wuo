@@ -230,6 +230,20 @@ def test_matches_renumbered_entry_to_the_same_loader(tmp_path: Path) -> None:
     assert result["result"]["order"] == "restored"
 
 
+def test_restores_verified_entry_removed_from_order_but_still_present(
+    tmp_path: Path,
+) -> None:
+    result = exercise(
+        tmp_path,
+        current={
+            "order": [2, 8],
+            "entries": {"1": "Limine", "2": "Windows", "8": "New"},
+        },
+    )
+    assert result["firmware_writes"] == ["1,2,8"]
+    assert result["result"]["order"] == "restored"
+
+
 def test_retains_reused_number_when_the_original_loader_has_moved(
     tmp_path: Path,
 ) -> None:
