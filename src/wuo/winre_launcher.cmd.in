@@ -37,6 +37,7 @@ set "HASHES=%BUNDLE%\hashes.txt"
 call :plain "%ROOT%\jobs" || goto bad_job
 call :plain "%JOB%" || goto bad_job
 call :match_marker "%JOB%\target.id" %JOB_ID% || goto bad_job
+if exist "%JOB%\feature.ready" goto authorize_feature
 if exist "%JOB%\apply.started" goto started
 if exist "%JOB%\state.ready" goto started
 call :plain "%MENU%\bundles" || goto bad_bundle
@@ -48,6 +49,60 @@ call "%BUNDLE%\recovery.cmd" apply %TARGET% %EFI% || goto failed_apply
 call :match_marker "%JOB%\state.ready" %JOB_ID% || goto failed_apply
 set "APPLIED=1"
 goto cleanup
+
+:authorize_feature
+call :match_marker "%JOB%\feature.ready" %JOB_ID% || goto bad_job
+if exist "%JOB%\apply.started" goto started_feature
+if exist "%JOB%\state.ready" goto started_feature
+if exist "%JOB%\authorized.id" goto started_feature
+if exist "%JOB%\claimed.id" goto feature_rollback
+call :plain "%JOB%\feature.json" || goto bad_job
+if exist "%JOB%\feature.protected" (
+    call :match_marker "%JOB%\feature.protected" %JOB_ID% || goto bad_job
+    call :verify_feature_asset "%JOB%\independent-preflight.done" "%JOB%\independent-preflight.sha256" || goto failed_feature_preflight
+    if not exist "%JOB%\rollback.required" goto failed_backup_check
+) else (
+    call :plain "%TARGET%\$WINDOWS.~BT\NewOS\Windows\System32\Config\SYSTEM" || goto bad_job
+)
+if exist "%JOB%\rollback.json" if not exist "%JOB%\rollback.required" goto failed_backup_check
+if exist "%JOB%\rollback.required" (
+    call :match_marker "%JOB%\rollback.required" %JOB_ID% || goto failed_backup_check
+    call :plain "%JOB%\rollback.json" || goto failed_backup_check
+    call :verify_feature_script restore || goto failed_backup_check
+    call "%JOB%\restore.cmd" check_backup "%~dp0" || goto failed_backup_check
+)
+if exist "%JOB%\source-hooks.cmd" (
+    call :verify_feature_script source-hooks || goto bad_job
+    call "%JOB%\source-hooks.cmd" %TARGET% || goto failed_feature_hooks
+)
+(>"%JOB%\authorize.tmp" echo(%JOB_ID%) || goto bad_job
+ren "%JOB%\authorize.tmp" authorized.id || goto bad_job
+set "APPLIED=1"
+goto cleanup
+
+:feature_rollback
+call :match_marker "%JOB%\claimed.id" %JOB_ID% || goto bad_job
+if not exist "%JOB%\restore.cmd" goto started_feature
+call :verify_feature_script restore || goto bad_job
+call "%JOB%\restore.cmd" check "%~dp0" || goto started_feature
+"%~dp0choice.exe" /C YN /N /M "Restore the previous Windows installation and its EFI files? [Y/N]"
+if not "%ERRORLEVEL%"=="1" goto cleanup
+call "%JOB%\restore.cmd" apply "%~dp0" || goto failed_restore
+set "APPLIED=1"
+goto cleanup
+
+:verify_feature_script
+call :verify_feature_asset "%JOB%\%~1.cmd" "%JOB%\%~1.sha256"
+exit /b
+:verify_feature_asset
+call :plain "%~1" || exit /b 1
+"%~dp0certutil.exe" -hashfile "%~1" SHA256 >"%WORK%\restore-hash.txt" 2>nul || exit /b 1
+set "RESTORE_DIGEST="
+for /f "usebackq skip=1 tokens=1" %%H in ("%WORK%\restore-hash.txt") do if not defined RESTORE_DIGEST set "RESTORE_DIGEST=%%H"
+if not defined RESTORE_DIGEST exit /b 1
+>"%WORK%\marker.expected.txt" echo(%RESTORE_DIGEST%
+call :match_marker_bytes "%~2"
+exit /b
 
 :resolve
 rem Reuse exactly one matching letter before attempting to attach a new one.
@@ -214,11 +269,26 @@ goto cleanup
 :started
 echo This offline update has already started. Review "%JOB%\recovery.log".
 goto cleanup
+:started_feature
+echo This feature upgrade already has a continuation in progress. Run wuo status from Windows.
+goto cleanup
 :bad_bundle
 echo The staged bundle could not be verified. Return to Windows to review the staged update.
 goto cleanup
 :failed_check
 echo The recovery check failed. Review the output before retrying this update.
+goto cleanup
+:failed_restore
+echo Feature rollback failed. Review the restore log on the rollback drive before restarting.
+goto cleanup
+:failed_backup_check
+echo The rollback backup could not be verified. Reconnect the backup drive and try again. Windows Setup has not been authorized.
+goto cleanup
+:failed_feature_hooks
+echo A source hook failed. Review "%JOB%\pre-feature.log". Setup was not authorized.
+goto cleanup
+:failed_feature_preflight
+echo Boot the generated Ventoy recovery image and finish its preflight before authorizing Setup.
 goto cleanup
 :failed_apply
 echo The recovery apply failed. Review "%JOB%\recovery.log" before continuing.

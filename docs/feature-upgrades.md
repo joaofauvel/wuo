@@ -1,8 +1,126 @@
-# Hooks before the first boot of a feature upgrade
+# Feature upgrades from a Windows ISO
 
-A full Windows Setup upgrade is not automated by `wuo`. Installations that need
-registry changes to access their boot disk require a stronger guarantee than a
-script that runs after the upgrade succeeds.
+## Protected upgrades with post hooks
+
+Use the protected route with an x64 English (United States) Microsoft ISO,
+a GPT Ventoy USB drive, and a separate NTFS backup drive. Wuo uses the
+generated recovery image to apply the captured post hooks before the upgraded
+Windows boots. Keep both drives connected through the upgrade.
+
+Firmware can try another boot entry if the recovery USB is unplugged or
+unavailable during startup. If protected recovery reports a failure, use its
+restore option before selecting Windows directly.
+
+If an older release installed your WinRE menu, finish any pending job,
+run `wuo remove`, and run `wuo setup` with your selected hooks again.
+
+```powershell
+wuo update --only features --feature-iso $iso --iso-sha256 $sha256 --accept-setup-eula --backup-drive D: --recovery-drive E: --preserve-boot-order
+```
+
+1. Wuo backs up Windows and EFI, builds the job's recovery image, and temporarily
+   selects it as Ventoy's default. Use the one-time UEFI boot menu to boot Ventoy
+   and let it select the generated image. Wait for the preflight result.
+2. Return to Windows and run `wuo update`. In WinRE, choose **Troubleshoot →
+   wuo** to authorize the staged job. After the upgrade, run `wuo status` in Windows.
+
+If independent recovery reports a failure, use the restore command shown
+there. It requires confirmation before restoring the saved Windows and EFI
+files. Before WinRE authorizes a protected job, `wuo status --discard` restores
+the prior Ventoy selection and retains the backup and logs.
+After rollback, keep Ventoy connected and run `wuo status` to restore its
+original configuration.
+
+Windows Backup warns about restoring with virtualization-based security enabled.
+Microsoft's UEFI revocation policy can prevent old backups or recovery media
+from booting. Check the recovery media and backup against your system's policy
+before starting. [Microsoft's VBS rollback guidance](https://support.microsoft.com/en-us/servicing/os/windows/2024/07/guidance-for-blocking-rollback-of-virtualization-based-security-vbs-related-security-updates)
+
+## Compatibility preview
+
+The normal `wuo update` scan includes feature upgrades. Use
+`wuo update --dry-run --only features` to list just those offers.
+
+The development branch checks whether Windows Setup can keep apps and data
+using a downloaded Microsoft ISO. You can supply the ISO even when Windows
+Update Agent has no feature offer. Windows Update offers still go through
+their normal package checks.
+Use an administrator PowerShell and get the SHA-256 for the exact ISO from
+the **Verify your download** section of Microsoft's download page.
+The preview compares the entire file against the digest you supply and checks
+the Setup signature. Use the published digest independently of the copy you
+want to verify. [Microsoft Windows 11 downloads](https://www.microsoft.com/en-us/software-download/windows11)
+
+```powershell
+wuo update --dry-run --only features --feature-iso 'C:\Downloads\Windows11.iso' --iso-sha256 '<Microsoft SHA-256>' --accept-setup-eula
+```
+
+Without a full feature offer, the ISO must contain one newer Windows 11 image
+matching the installed edition, architecture and default system UI language.
+When previewing against a full feature offer, that image must also match
+the offered base build. Setup runs a compatibility scan and can write Panther
+logs. The preview stages no
+recovery job and requests no restart. `--accept-setup-eula` accepts the
+applicable Microsoft software license terms for the scan.
+
+## Opt in to rollback
+
+Add `--backup-drive F:` to enable wuo rollback for that feature upgrade. Choose
+a healthy NTFS volume on a disk separate from Windows and EFI. Allow enough
+space for the used Windows volume and EFI files. The option also works with
+`--dry-run` to show the plan.
+Windows Setup retains its own recovery behavior either way.
+
+Without a backup drive, a failed upgrade can leave Windows unbootable with
+no wuo backup to restore. Before staging, wuo asks for confirmation in an
+interactive terminal. The default answer is No. Noninteractive feature
+upgrades require a backup drive.
+
+Before staging, wuo backs up Windows and the Windows EFI files. It puts a
+copy of the rollback launcher in
+`F:\WUO-Rollback\<job>\recovery\restore.cmd`. WinRE identifies the volumes
+by ID and verifies the backup before authorizing Setup. When Windows resumes,
+wuo rechecks the backup catalog before committing the upgrade. Keep the drive
+connected through both steps.
+
+Under **Troubleshoot → wuo**, a compatible pending rollback is offered for
+confirmation. From independent WinRE, use the backup drive's recovery
+letter and run `restore.cmd check` to check eligibility before `restore.cmd apply`.
+
+Rollback restores Windows Boot Manager's files and BCD on EFI.
+
+## Preserve the UEFI boot order
+
+Add `--preserve-boot-order` to a full feature upgrade to save the current
+firmware boot order and eligible EFI fallback loader. The flag is available
+with or without `--backup-drive`. Use `--dry-run` to see the EFI partition,
+boot order, and fallback file before staging.
+
+The saved snapshot belongs to the job that captured it. If an older job is
+already staged, `wuo status` shows that job and its hooks. Keep the staged
+files and backup until you have a tested way to replace the deferred job.
+
+After Setup completes, wuo restores the saved order by matching the original
+entries to their current loader identities. It keeps newly added entries.
+If Setup replaced an existing third-party fallback with the verified Windows
+Boot Manager, wuo restores the captured file. `wuo status` shows the outcome
+and identifies entries or files that need manual attention.
+
+## Retry a precommit failure
+
+Use an administrator PowerShell to review a failed legacy feature job.
+
+```powershell
+wuo status
+wuo retry-feature --dry-run
+```
+
+RC4 reports the block for a captured post hook before checking its rollback
+backup. Leave such a job unapproved and retain its recovery files. For eligible
+jobs without post hooks, the preview checks the current Windows installation
+and the original backup catalog for that job.
+
+## Preboot hooks
 
 The required sequence is:
 
@@ -35,7 +153,7 @@ Registry edits to a staged image, polling for hive files, or changing boot order
 at an assumed time are not sufficient evidence of that guarantee. Setup can
 perform more work after the edit or replace the boot configuration.
 
-## Validation required before implementation
+## Validation before using a production installation
 
 Use a disposable VM with a full replacement upgrade, rather than an enablement
 package, to record when each new hive is created, loaded, migrated and finalized.

@@ -120,6 +120,7 @@ On a dual-boot PC, select your usual Windows entry after the restart. Run
 to rescan and continue any remaining updates. Windows package jobs precede driver
 jobs; the tool checks the new Windows baseline before preparing the next job.
 
+`wuo update` scans all categories that Windows Update Agent offers to this PC.
 Use `wuo update --dry-run` to preview without installing. Limit a scan with
 `--only monthly`, `--only dotnet`, `--only drivers`, `--only defender`,
 `--only security-platform`, or `--only features`. Repeat `--only` to combine them.
@@ -147,10 +148,9 @@ To remove the recovery menu entry, run `wuo remove` in an administrator PowerShe
   Update Agent. Platform updates precede intelligence. Each result is recorded
   and independently checked; a restart requirement stops the next phase.
 - **Feature updates.** Standalone CBS enablement packages can use recovery
-  servicing. Full upgrades that require Windows Setup remain unsupported. In
-  particular, a post-upgrade script runs too late for hooks needed before the new
-  Windows installation first boots. See the [feature-upgrade hook requirements](docs/feature-upgrades.md).
-  `wuo media` opens Microsoft's media link.
+  servicing. Full Windows Setup upgrades appear in the scan. See the
+  [feature-upgrade instructions](docs/feature-upgrades.md) for checking an ISO
+  and using the protected recovery handoff.
 - **Other installers.** Downloading a package does not count as installing it.
   Offers without a supported installation route are listed with their files and
   remain incomplete.

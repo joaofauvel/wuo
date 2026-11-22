@@ -14,8 +14,10 @@ lazy import httpx
 
 from .models import DownloadManifest, Update
 lazy from . import bundle, catalog, downloads, feeds, target
+lazy from .feature_upgrade import FeatureMedia
 lazy from .hook_registry import HookRegistry
 lazy from .hook_selection import describe_selection, read_selection, resolve_selection
+lazy from .hooks import require_full_upgrade_hook_support
 lazy from .update import PreparedUpdates, run_update
 lazy from .winre_menu import Menu
 
@@ -57,7 +59,11 @@ async def _update(client: httpx.AsyncClient, args: argparse.Namespace) -> int:
     output = args.output or Path.home() / _DOWNLOADS
     if configured and not args.dry_run:
         allow_restart = not (args.hook or args.profile or args.no_hooks)
-        if not await asyncio.to_thread(menu.resume, allow_restart=allow_restart):
+        if not await asyncio.to_thread(
+            menu.resume,
+            allow_restart=allow_restart,
+            require_boot_preservation=getattr(args, "preserve_boot_order", False),
+        ):
             return 1 if menu.windows_incomplete else 0
     with tempfile.TemporaryDirectory(prefix="wuo-hooks-") as temporary:
         if args.hook or args.profile or args.no_hooks or not menu.installed:
@@ -70,6 +76,29 @@ async def _update(client: httpx.AsyncClient, args: argparse.Namespace) -> int:
         )
 
 
+def _confirm_feature_without_backup() -> bool:
+    print(
+        "Warning: A failed feature upgrade can leave Windows unbootable. "
+        "Without a backup drive, wuo has no Windows or EFI backup to restore.",
+        file=sys.stderr,
+    )
+    if sys.stdin is None or not sys.stdin.isatty():
+        print(
+            "Use an interactive terminal to confirm or pass --backup-drive LETTER:.",
+            file=sys.stderr,
+        )
+        return False
+    try:
+        return input(
+            "Continue without a wuo rollback backup? [y/N] "
+        ).strip().casefold() in {
+            "y",
+            "yes",
+        }
+    except EOFError:
+        return False
+
+
 async def _stage_update(
     client: httpx.AsyncClient,
     args: argparse.Namespace,
@@ -79,27 +108,56 @@ async def _stage_update(
     output: Path,
     profile: Path | None,
 ) -> int:
+    iso = getattr(args, "feature_iso", None)
+    feature_media = (
+        FeatureMedia(
+            iso,
+            args.iso_sha256,
+            rollback=bool(args.backup_drive),
+            preserve_boot_order=getattr(args, "preserve_boot_order", False),
+            recovery_drive=getattr(args, "recovery_drive", None),
+        )
+        if iso is not None
+        else None
+    )
+    if args.dry_run and feature_media and feature_media.recovery_drive:
+        from .feature_upgrade import feature_recovery_selection
 
-    async def scan(prepared: PreparedUpdates | None = None) -> int:
+        recovery = await asyncio.to_thread(
+            feature_recovery_selection,
+            identity,
+            feature_media.recovery_drive,
+            args.backup_drive,
+        )
+        print(
+            f"Verified independent recovery entry {recovery['id']} "
+            f"on the Ventoy drive {feature_media.recovery_drive}."
+        )
+
+    async def scan(
+        prepared: PreparedUpdates | None = None, *, dry_run: bool = args.dry_run
+    ) -> int:
         return await run_update(
             client,
             identity,
             output,
             only=tuple(args.only),
-            dry_run=args.dry_run,
+            dry_run=dry_run,
             driver_cache_fallback=args.driver_cache,
             profile=profile,
             extractor=args.extractor,
             prepared=prepared,
+            feature_media=feature_media,
         )
 
     if not configured:
         if getattr(args, "manual", False):
             return await scan()
+        result = await scan(PreparedUpdates(output), dry_run=True)
         if args.dry_run:
-            return await scan(PreparedUpdates(output))
+            return result
         print(
-            "Windows updates are not installed by this command until setup is complete. Run wuo setup, then wuo update. Use --manual only to download packages for manual installation."
+            "Run wuo setup to enable staging and recovery servicing. Use --manual to download packages for manual installation."
         )
         return 1
     if args.dry_run:
@@ -133,9 +191,50 @@ async def _stage_update(
             print(f"{len(prepared.manual)} update(s) still require installation.")
             result = 1
         if not prepared.drivers and not prepared.monthly:
-            print("No update was staged for WinRE.")
-            return result
+            if prepared.feature is None or feature_media is None:
+                print("No update was staged for WinRE.")
+                return result
+            if result:
+                print(
+                    "Resolve the other update failures before preparing the full feature upgrade."
+                )
+                return result
+            if feature_media.recovery_drive is None:
+                require_full_upgrade_hook_support(read_selection(profile).hooks)
+            current = await asyncio.to_thread(target.read_target)
+            if replace(current, loader_guid=identity.loader_guid) != identity:
+                raise ValueError("The running Windows build changed during the scan.")
+            menu = Menu(current)
+            if not feature_media.rollback and not _confirm_feature_without_backup():
+                print("Feature upgrade canceled before staging.")
+                return 1
+            if feature_media.recovery_drive is None:
+                print(
+                    "Preparing Windows Setup. Use Troubleshoot > wuo to continue after preparation."
+                )
+            else:
+                print("Preparing the rollback backup and independent Ventoy recovery.")
+            job = await asyncio.to_thread(
+                menu.stage_feature,
+                feature_media,
+                prepared.feature,
+                profile,
+                backup_drive=args.backup_drive,
+            )
+            print("Feature upgrade staged.")
+            if feature_media.recovery_drive is None:
+                await asyncio.to_thread(menu.offer_restart)
+            else:
+                print(
+                    f"Boot Ventoy once and let it select WUO-Recovery-{job.name}.iso automatically. "
+                    "Return to Windows and run wuo update after it succeeds."
+                )
+            return 0
         category = "monthly" if prepared.monthly else "drivers"
+        if prepared.feature is not None:
+            print(
+                "The full feature upgrade will wait for these updates. Run the same command after restarting."
+            )
         remaining = (
             len(prepared.monthly) - 1 + bool(prepared.drivers)
             if prepared.monthly
@@ -324,7 +423,42 @@ def main(argv: Sequence[str] | None = None) -> int:
     workflow.add_argument(
         "--dry-run",
         action="store_true",
-        help="Preview planned installation and recovery servicing without making changes.",
+        help="Preview planned installation and recovery servicing.",
+    )
+    workflow.add_argument(
+        "--feature-iso",
+        type=Path,
+        metavar="ISO",
+        help="Use a downloaded Microsoft ISO for a full feature upgrade, even without a Windows Update offer.",
+    )
+    workflow.add_argument(
+        "--iso-sha256",
+        metavar="SHA256",
+        help="Microsoft-published SHA-256 of the feature ISO.",
+    )
+    workflow.add_argument(
+        "--accept-setup-eula",
+        action="store_true",
+        help="Accept the Windows Setup license terms for the selected media.",
+    )
+    feature_backup = workflow.add_mutually_exclusive_group()
+    feature_backup.add_argument(
+        "--no-rollback", action="store_true", help=argparse.SUPPRESS
+    )
+    feature_backup.add_argument(
+        "--backup-drive",
+        metavar="LETTER:",
+        help="Enable wuo rollback for the feature upgrade using this separate NTFS drive.",
+    )
+    workflow.add_argument(
+        "--preserve-boot-order",
+        action="store_true",
+        help="Preserve UEFI boot order and the existing EFI fallback loader after a full feature upgrade.",
+    )
+    workflow.add_argument(
+        "--recovery-drive",
+        metavar="DRIVE",
+        help="Use a separate GPT Ventoy USB drive for protected feature-upgrade hooks and recovery.",
     )
     workflow.add_argument(
         "--driver-cache",
@@ -367,6 +501,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--discard",
         action="store_true",
         help="Clear the pending job and keep its files and logs.",
+    )
+    retry = commands.add_parser(
+        "retry-feature",
+        help="Restage a failed feature upgrade with its existing rollback backup.",
+    )
+    retry.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Check retry eligibility without staging.",
     )
     commands.add_parser("remove", help="Remove wuo from the recovery menu.")
     hook_commands = commands.add_parser(
@@ -478,6 +621,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     try:
         args = parser.parse_args(argv)
+        if args.command == "update":
+            if args.feature_iso is not None:
+                if not args.iso_sha256 or not args.accept_setup_eula:
+                    workflow.error(
+                        "--feature-iso requires --iso-sha256 and --accept-setup-eula"
+                    )
+                if args.recovery_drive and (
+                    not args.backup_drive or not args.preserve_boot_order
+                ):
+                    workflow.error(
+                        "--recovery-drive requires --backup-drive and --preserve-boot-order"
+                    )
+                preparing = not args.dry_run and (
+                    not args.only or "features" in args.only
+                )
+                if preparing and args.manual:
+                    workflow.error(
+                        "Use --dry-run to check a feature ISO in manual mode."
+                    )
+            elif (
+                args.iso_sha256
+                or args.accept_setup_eula
+                or args.no_rollback
+                or args.backup_drive
+                or args.preserve_boot_order
+                or args.recovery_drive
+            ):
+                workflow.error("ISO and feature recovery options require --feature-iso")
     except SystemExit as result:
         return int(result.code) if isinstance(result.code, int) else 1
     if args.command is None:
@@ -489,7 +660,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "hooks":
             return _hooks_command(args)
-        if args.command in {"setup", "status", "remove"}:
+        if args.command in {"setup", "status", "remove", "retry-feature"}:
             menu = Menu(target.read_target(read_loader=False))
             if args.command == "setup":
                 with tempfile.TemporaryDirectory(prefix="wuo-hooks-") as temporary:
@@ -508,6 +679,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     menu.describe_pending_hooks(registry)
             elif args.command == "remove":
                 menu.remove()
+            elif args.command == "retry-feature":
+                menu.retry_feature(dry_run=args.dry_run)
             elif args.discard:
                 menu.discard()
             else:

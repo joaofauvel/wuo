@@ -1,0 +1,106 @@
+@echo off
+setlocal EnableExtensions DisableDelayedExpansion
+if /i not "%SystemRoot%"=="X:\Windows" exit /b 1
+set "WORK=X:\Windows\Temp\wuo-safeos-%RANDOM%-%RANDOM%"
+set "SYS=%SystemRoot%\System32"
+set "RECOVERY=@@RECOVERY@@"
+mkdir "%WORK%" || goto stop
+wpeinit || goto stop
+call :resolve "@@WINDOWS@@" || goto stop
+set "TARGET=%LETTER%:"
+set "JOB=%TARGET%\ProgramData\WinOfflineUpdate\jobs\@@JOB@@"
+call :match_job "%JOB%\target.id" || goto stop
+call :match_job "%JOB%\claimed.id" || goto stop
+set "LOG=%JOB%\safeos.log"
+>>"%LOG%" echo Checking firmware protection before native SafeOS
+call :resolve "@@EFI@@" || goto stop
+set "EFI=%LETTER%:"
+if /i "%EFI%"=="%TARGET%" goto stop
+call :resolve "@@RECOVERY_EFI@@" || goto stop
+set "RECOVERY_EFI=%LETTER%:"
+if not exist "%EFI%\EFI\Microsoft\Boot\BCD" goto stop
+if not exist "%RECOVERY_EFI%@@LOADER@@" goto stop
+"%SYS%\bcdedit.exe" /sysstore %EFI% >>"%LOG%" 2>&1 || goto stop
+"%SYS%\bcdedit.exe" /enum %RECOVERY% /v >"%WORK%\entry.txt" 2>&1 || goto stop
+set "MATCH="
+set "DEVICE_MATCH="
+for /f "usebackq tokens=1,2" %%A in ("%WORK%\entry.txt") do if /i "%%A"=="path" if /i "%%B"=="@@LOADER@@" set "MATCH=1"
+for /f "usebackq tokens=1,2" %%A in ("%WORK%\entry.txt") do if /i "%%A"=="device" if /i "%%B"=="partition=%RECOVERY_EFI%" set "DEVICE_MATCH=1"
+if not defined MATCH goto stop
+if not defined DEVICE_MATCH goto stop
+"%SYS%\bcdedit.exe" /enum {fwbootmgr} /v >"%WORK%\manager.txt" 2>&1 || goto stop
+call :check_order || goto stop
+call :check_available || goto stop
+"%SYS%\bcdedit.exe" /set {fwbootmgr} bootsequence %RECOVERY% >>"%LOG%" 2>&1 || goto stop
+"%SYS%\bcdedit.exe" /enum {fwbootmgr} /v >"%WORK%\manager.txt" 2>&1 || goto stop
+call :check_order || goto stop
+call :check_next || goto stop
+if not exist "%JOB%\safeos.ready" (
+    (>"%JOB%\safeos.tmp" echo @@JOB@@) || goto stop
+    ren "%JOB%\safeos.tmp" safeos.ready || goto stop
+)
+call :match_job "%JOB%\safeos.ready" || goto stop
+>>"%LOG%" echo Verified recovery-first order and the one-time recovery selection
+start "" /wait X:\sources\recovery\recenv.exe
+if errorlevel 1 goto stop
+wpeutil reboot
+exit /b 0
+
+:stop
+if defined LOG >>"%LOG%" echo SafeOS could not verify the recovery handoff. Native Setup was held.
+echo Wuo could not verify the recovery handoff. Recovery remains selected.
+wpeutil shutdown
+exit /b 1
+
+:check_order
+for /f "usebackq tokens=1,2" %%A in ("%WORK%\manager.txt") do if /i "%%A"=="displayorder" if /i "%%B"=="%RECOVERY%" exit /b 0
+exit /b 1
+
+:check_available
+for /f "usebackq tokens=1,2" %%A in ("%WORK%\manager.txt") do if /i "%%A"=="bootsequence" if /i not "%%B"=="%RECOVERY%" exit /b 1
+exit /b 0
+
+:check_next
+for /f "usebackq tokens=1,2" %%A in ("%WORK%\manager.txt") do if /i "%%A"=="bootsequence" if /i "%%B"=="%RECOVERY%" exit /b 0
+exit /b 1
+
+:match_job
+if not exist "%~1" exit /b 1
+for %%F in ("%~1") do if not "%%~zF"=="38" exit /b 1
+setlocal EnableDelayedExpansion
+set "VALUE="
+set /p "VALUE="<"%~1"
+if "!VALUE!"=="@@JOB@@" exit /b 0
+exit /b 1
+
+:resolve
+set "WANTED=%~1"
+set "LETTER="
+set "LETTERS=Z Y W V U T S R Q P O N M L K J I H G F E D C B A"
+for %%D in (%LETTERS%) do call :find_letter %%D || exit /b 1
+if defined LETTER exit /b 0
+for %%D in (%LETTERS%) do if not defined LETTER call :attach %%D
+if not defined LETTER exit /b 1
+exit /b 0
+
+:find_letter
+call :read_volume %~1 || exit /b 0
+if /i not "%CURRENT%"=="%WANTED%" exit /b 0
+if defined LETTER exit /b 1
+set "LETTER=%~1"
+exit /b 0
+
+:attach
+call :read_volume %~1 && exit /b 1
+if exist %~1:\ exit /b 1
+"%SYS%\mountvol.exe" %~1:\ %WANTED% >nul 2>&1 || exit /b 1
+call :read_volume %~1 || exit /b 1
+if /i not "%CURRENT%"=="%WANTED%" exit /b 1
+set "LETTER=%~1"
+exit /b 0
+
+:read_volume
+set "CURRENT="
+"%SYS%\mountvol.exe" %~1:\ /L >"%WORK%\volume.txt" 2>nul || exit /b 1
+for /f "usebackq tokens=1" %%V in ("%WORK%\volume.txt") do set "CURRENT=%%V"
+exit /b 0

@@ -250,45 +250,7 @@ if /i "%CBS_STATE%"=="Superseded" exit /b 0
 >>"%LOG%" echo CBS package did not reach an installed or pending state. Inspect "%CBS_FILE%".
 exit /b 1
 
-:open_hook_hive
-"%SYS%\reg.exe" load "%HOOK_HIVE%" "%TARGET%\Windows\System32\Config\SYSTEM" >>"%LOG%" 2>&1 || exit /b 1
-"%SYS%\reg.exe" save "%HOOK_HIVE%" "%JOB%\%PHASE%-SYSTEM.hiv" >>"%LOG%" 2>&1 || goto hook_failed
-set "CS_VALUE="
-for /f "tokens=1,2,3" %%A in ('X:\Windows\System32\reg.exe query "%HOOK_HIVE%\Select" /v Default 2^>nul') do if /i "%%A"=="Default" if /i "%%B"=="REG_DWORD" set "CS_VALUE=%%C"
-if not defined CS_VALUE goto hook_failed
-set /a "CS=CS_VALUE" >nul 2>&1 || goto hook_failed
-if %CS% LSS 1 goto hook_failed
-if %CS% GTR 999 goto hook_failed
-set "CS=00%CS%"
-set "CS=%CS:~-3%"
-exit /b 0
-
-:read_hook
-set "ACTUAL="
-for /f "tokens=1,2,3" %%A in ('X:\Windows\System32\reg.exe query "%HOOK_KEY%" /v "%HOOK_NAME%" 2^>nul') do if /i "%%A"=="%HOOK_NAME%" if /i "%%B"=="REG_DWORD" set "ACTUAL=%%C"
-if not defined ACTUAL exit /b 1
-exit /b 0
-
-:inspect_hook
-call :read_hook || exit /b 1
-(>>"%JOB%\%PHASE%-values.txt" echo "%HOOK_KEY%" /v "%HOOK_NAME%" was %ACTUAL%) || exit /b 1
-if not defined HOOK_EXPECTED exit /b 0
-if /i "%ACTUAL%"=="%HOOK_EXPECTED%" exit /b 0
-if /i "%ACTUAL%"=="%HOOK_NEW%" exit /b 0
-exit /b 1
-
-:write_hook
-call :read_hook || exit /b 1
-if /i "%ACTUAL%"=="%HOOK_NEW%" exit /b 0
-"%SYS%\reg.exe" add "%HOOK_KEY%" /v "%HOOK_NAME%" /t REG_DWORD /d "%HOOK_NEW%" /f >>"%LOG%" 2>&1 || exit /b 1
-call :read_hook || exit /b 1
-if /i not "%ACTUAL%"=="%HOOK_NEW%" exit /b 1
-exit /b 0
-
-:hook_failed
->>"%LOG%" echo Hook phase %PHASE% failed. Inspect the phase hive backup and value log.
-"%SYS%\reg.exe" unload "%HOOK_HIVE%" >>"%LOG%" 2>&1
-exit /b 1
+@@HOOK_HELPERS@@
 
 :not_winre
 echo Start this command from WinRE. No servicing was attempted.

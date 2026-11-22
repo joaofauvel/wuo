@@ -1,0 +1,53 @@
+@echo off
+setlocal EnableExtensions DisableDelayedExpansion
+set "SYS=%SystemRoot%\System32"
+set "NEWOS=%SYSTEMDRIVE%\$WINDOWS.~BT\NewOS\Windows"
+set "JOB=%SYSTEMDRIVE%\ProgramData\WinOfflineUpdate\jobs\@@JOB@@"
+set "LOG=%JOB%\precommit.log"
+set "PHASE=post"
+set "HOOK_HIVE=HKLM\WUO_SYSTEM_@@JOB@@"
+set "SOFTWARE=HKLM\WUO_SOFTWARE_@@JOB@@"
+set "VERSION_KEY=Microsoft\Windows NT\CurrentVersion"
+if not exist "%JOB%\claimed.id" exit /b 77
+if exist "%JOB%\precommit.expected" exit /b 77
+if exist "%JOB%\precommit.done" exit /b 77
+(>"%JOB%\precommit.expected" echo @@JOB@@) || exit /b 77
+"%SYS%\fc.exe" /b "%JOB%\claimed.id" "%JOB%\precommit.expected" >nul 2>&1 || goto failed
+set "REG_KEY=HKLM\SOFTWARE\Microsoft\Cryptography"
+call :verify_identity MachineGuid REG_SZ @@MACHINE@@ || goto failed
+set "REG_KEY=HKLM\SOFTWARE\%VERSION_KEY%"
+call :verify_identity CurrentBuildNumber REG_SZ @@SOURCE_BUILD@@ || goto failed
+call :verify_identity UBR REG_DWORD @@SOURCE_REVISION@@ || goto failed
+if not exist "%NEWOS%\System32\Config\SYSTEM" goto failed
+"%SYS%\reg.exe" load "%SOFTWARE%" "%NEWOS%\System32\Config\SOFTWARE" >>"%LOG%" 2>&1 || goto failed
+set "REG_KEY=%SOFTWARE%\%VERSION_KEY%"
+call :verify_replacement
+set "VERIFY_EXIT=%ERRORLEVEL%"
+"%SYS%\reg.exe" unload "%SOFTWARE%" >>"%LOG%" 2>&1 || goto failed
+if not "%VERIFY_EXIT%"=="0" goto failed
+call :apply_hooks || goto failed
+ren "%JOB%\precommit.expected" precommit.done || goto failed
+>>"%LOG%" echo Staged Windows identity and post-update hooks verified.
+exit /b 0
+
+:failed
+>>"%LOG%" echo Staged Windows precommit validation failed. Setup must stop.
+>"%JOB%\precommit.failed" echo @@JOB@@
+exit /b 77
+
+:verify_replacement
+call :verify_identity CurrentBuildNumber REG_SZ @@TARGET_BUILD@@ || exit /b 1
+call :verify_identity UBR REG_DWORD @@TARGET_REVISION@@ || exit /b 1
+call :verify_identity EditionID REG_SZ @@TARGET_EDITION@@ || exit /b 1
+exit /b 0
+
+:verify_identity
+"%SYS%\reg.exe" query "%REG_KEY%" /v "%~1" >"%JOB%\precommit-value.txt" 2>>"%LOG%" || exit /b 1
+for /f "usebackq tokens=1,2,*" %%A in ("%JOB%\precommit-value.txt") do if /i "%%A"=="%~1" if /i "%%B"=="%~2" if /i "%%C"=="%~3" exit /b 0
+>>"%LOG%" echo Registry identity check failed for %~1.
+exit /b 1
+
+:apply_hooks
+@@HOOKS@@
+
+@@HOOK_HELPERS@@

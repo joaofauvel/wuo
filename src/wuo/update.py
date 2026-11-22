@@ -14,7 +14,7 @@ import httpx
 from . import bundle, catalog, downloads, feeds, target
 from .models import Update
 from .target import TargetIdentity
-lazy from . import driver_cache
+lazy from . import driver_cache, feature_upgrade
 
 _UPGRADES = "3689bdc8-b205-4af4-8d4a-a63924c5e9d5"
 _ARCH = re.compile(
@@ -84,6 +84,11 @@ $updates = @(
             type = [int]$update.Type
             hardware = $hardwareId
             payloads = $payloads
+            kb_articles = @(
+                for ($j = 0; $j -lt $update.KBArticleIDs.Count; $j++) {
+                    [string]$update.KBArticleIDs.Item($j)
+                }
+            )
             categories = @(
                 for ($j = 0; $j -lt $update.Categories.Count; $j++) {
                     [string]$update.Categories.Item($j).CategoryID
@@ -117,6 +122,7 @@ class Offer:
     hardware_verified: bool = False
     payload_names: tuple[str, ...] = ()
     revision: int | None = None
+    kb_articles: tuple[str, ...] = ()
 
 
 def _builds(title: str) -> set[tuple[int, int]]:
@@ -171,6 +177,10 @@ def parse_offers(raw: str) -> tuple[list[Offer], str | None]:
         hardware_id = item.get("hardware")
         hardware_id = hardware_id if isinstance(hardware_id, str) else ""
         revision = item.get("revision")
+        kb_numbers = (
+            value.strip().upper().removeprefix("KB")
+            for value in _strings(item.get("kb_articles"))
+        )
         offers[update_id] = Offer(
             update_id,
             title,
@@ -184,6 +194,13 @@ def parse_offers(raw: str) -> tuple[list[Offer], str | None]:
             revision
             if isinstance(revision, int) and not isinstance(revision, bool)
             else None,
+            tuple(
+                dict.fromkeys(
+                    f"KB{number}"
+                    for number in kb_numbers
+                    if re.fullmatch(r"[0-9]+", number)
+                )
+            ),
         )
     return list(offers.values()), issue
 
@@ -487,6 +504,7 @@ class PreparedUpdates:
     monthly: list[Path] = field(default_factory=list)
     manual: list[ManualUpdate] = field(default_factory=list)
     security: list[Offer] = field(default_factory=list)
+    feature: feature_upgrade.FeatureImage | None = None
 
 
 async def _export_driver(
@@ -518,6 +536,7 @@ async def _process_offer(
     profile: Path | None,
     extractor: str,
     prepared: PreparedUpdates | None,
+    setup_candidates: list[Offer] | None = None,
 ) -> bool:
     print(f"\n[{offer.category}] {offer.title} ({offer.id})", flush=True)
     if prepared is not None:
@@ -552,6 +571,12 @@ async def _process_offer(
         try:
             selected = await _package(client, offer, identity)
         except catalog.SourceError:
+            if (
+                setup_candidates is not None
+                and feature_upgrade.offered_release(offer, identity) is not None
+            ):
+                setup_candidates.append(offer)
+                return True
             if (
                 tried_driver_cache
                 or not driver_cache_fallback
@@ -649,7 +674,13 @@ async def _process_offer(
                 f"{identity.release} {identity.architecture} and the hardware ID above."
             )
         elif offer.category == "features":
-            print(f"  If full Setup media is required: {feeds.WINDOWS_MEDIA}")
+            if offer.kb_articles:
+                print(f"  Windows Update articles: {', '.join(offer.kb_articles)}")
+            if feature_upgrade.offered_release(offer, identity) is not None:
+                print(
+                    "  Use --dry-run --feature-iso to check compatibility with Microsoft Setup media."
+                )
+            print(f"  Microsoft Setup media: {feeds.WINDOWS_MEDIA}")
         elif offer.category == "defender":
             print(f"  Security intelligence downloads: {feeds.DEFENDER}")
         return False
@@ -666,7 +697,14 @@ async def run_update(
     profile: Path | None = None,
     extractor: str = "7z.exe",
     prepared: PreparedUpdates | None = None,
+    feature_media: feature_upgrade.FeatureMedia | None = None,
 ) -> int:
+    if only and "features" not in only:
+        feature_media = None
+    if feature_media is not None and not dry_run and prepared is None:
+        raise ValueError(
+            "Preparing a full feature upgrade requires the installed WinRE menu."
+        )
     print(
         f"Scanning Windows {identity.release} {identity.architecture} ({identity.build}.{identity.revision}) via Windows Update Agent…",
         flush=True,
@@ -674,15 +712,17 @@ async def run_update(
     try:
         offers, issue = await asyncio.to_thread(scan_offers, identity)
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
-        print(f"Could not discover applicable updates: {error}")
-        return 1
+        offers = []
+        issue = f"Could not discover applicable updates: {error}"
     if issue:
         print(issue)
     selected = [offer for offer in offers if not only or offer.category in only]
     if not selected:
         print("No matching offers from this scan.")
-        return int(bool(issue))
+        if feature_media is None:
+            return int(bool(issue))
     failures = 0
+    setup_candidates: list[Offer] | None = [] if feature_media is not None else None
     for offer in selected:
         completed = await _process_offer(
             client,
@@ -694,10 +734,28 @@ async def run_update(
             profile=profile,
             extractor=extractor,
             prepared=prepared,
+            setup_candidates=setup_candidates,
         )
         failures += not completed
+    if feature_media is not None:
+        from .winre_menu import Menu
+
+        try:
+            with Menu(identity).feature_preview():
+                image = await feature_upgrade.check_feature(
+                    client,
+                    identity,
+                    setup_candidates or [],
+                    feature_media,
+                    preview=dry_run,
+                )
+                if prepared is not None:
+                    prepared.feature = image
+        except (OSError, ValueError, httpx.HTTPError) as error:
+            print(f"Feature compatibility check incomplete: {error}")
+            failures += max(1, len(setup_candidates or []))
     print(
-        f"\n{len(selected)} offer(s) checked, {failures} lookup or download failure(s)."
+        f"\n{len(selected)} offer(s) checked, {failures} lookup, download, or compatibility failure(s)."
     )
     if prepared is not None:
         if prepared.security:
@@ -713,4 +771,5 @@ async def run_update(
                 print(f"  [{item.category}] {item.title}")
                 print(f"    Files: {item.directory}")
                 print(f"    {item.route}")
-    return int(bool(failures or issue))
+    iso_only = feature_media is not None and set(only) == {"features"}
+    return int(bool(failures or (issue and not iso_only)))

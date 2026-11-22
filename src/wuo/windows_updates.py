@@ -372,6 +372,27 @@ def install(
     return result
 
 
+def require_completed_phase(target: TargetIdentity, root: Path) -> None:
+    """Inspect a saved Windows phase without updating its request or journal."""
+    request_path = root / "windows-request.json"
+    journal = root / JOURNAL
+    if not request_path.exists() and not journal.exists():
+        return
+    message = "Resolve the previous Windows update phase with wuo status first."
+    try:
+        request = json.loads(request_path.read_text(encoding="utf-8-sig"))
+        saved = json.loads(journal.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError as error:
+        raise ValueError(message) from error
+    if (
+        not isinstance(saved, dict)
+        or saved.get("phase_complete") is not True
+        or not read_result(journal, target, request).complete
+    ):
+        raise ValueError(message)
+    _verify_completion(journal, saved)
+
+
 def verify(target: TargetIdentity, root: Path) -> WindowsResult | None:
     journal = root / JOURNAL
     if not journal.is_file():

@@ -1,0 +1,18 @@
+@echo off
+setlocal EnableExtensions DisableDelayedExpansion
+if /i not "%SystemRoot%"=="X:\Windows" exit /b 1
+set "SYS=%SystemRoot%\System32"
+set "JOB=%~dp0."
+set "TARGET=%~1"
+set "PHASE=pre-feature"
+set "HOOK_HIVE=HKLM\WUO_FEATURE_SOURCE"
+set "LOG=%JOB%\pre-feature.log"
+set "RESTORE_FAILED="
+if not exist "%TARGET%\Windows\System32\Config\SYSTEM" exit /b 1
+call :apply_hooks || exit /b 1
+exit /b 0
+
+:apply_hooks
+@@HOOKS@@
+
+@@HOOK_HELPERS@@

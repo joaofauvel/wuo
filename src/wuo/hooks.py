@@ -17,6 +17,14 @@ class Hook:
     scope: Literal["control-set", "system"] = "control-set"
 
 
+def require_full_upgrade_hook_support(hooks: tuple[Hook, ...]) -> None:
+    if any(hook.phase == "post" for hook in hooks):
+        raise ValueError(
+            "Full ISO feature upgrades with post hooks are blocked. "
+            "These hooks need verification after SafeOS and before Windows boots."
+        )
+
+
 def load_profile(path: Path) -> tuple[Hook, ...]:
     with path.open("rb") as stream:
         profile = tomllib.load(stream)

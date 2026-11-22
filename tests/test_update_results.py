@@ -275,7 +275,7 @@ def test_unconfigured_plain_update_requires_setup_before_mutation(
     calls = []
 
     async def scan(*_: object, **options: object) -> int:
-        calls.append(options["prepared"])
+        calls.append((options["prepared"], options["dry_run"]))
         return 0
 
     monkeypatch.setattr(cli, "run_update", scan)
@@ -294,11 +294,13 @@ def test_unconfigured_plain_update_requires_setup_before_mutation(
 
     assert asyncio.run(run()) == expected
     if not manual and not dry_run:
-        assert calls == [] and "wuo setup" in capsys.readouterr().out
+        assert len(calls) == 1 and isinstance(calls[0][0], update.PreparedUpdates)
+        assert calls[0][1] is True and "wuo setup" in capsys.readouterr().out
     elif manual:
-        assert calls == [None]
+        assert calls == [(None, dry_run)]
     else:
-        assert len(calls) == 1 and isinstance(calls[0], update.PreparedUpdates)
+        assert len(calls) == 1 and isinstance(calls[0][0], update.PreparedUpdates)
+        assert calls[0][1] is True
 
 
 def test_repeat_native_restart_returns_incomplete_exit_status(

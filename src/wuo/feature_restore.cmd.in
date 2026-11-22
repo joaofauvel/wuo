@@ -1,0 +1,166 @@
+@echo off
+setlocal EnableExtensions DisableDelayedExpansion
+if /i not "%SystemRoot%"=="X:\Windows" exit /b 1
+if /i not "%~1"=="check" if /i not "%~1"=="apply" if /i not "%~1"=="check_backup" exit /b 2
+set "SYS=%SystemRoot%\System32"
+set "WORK=X:\Windows\Temp\wuo-rollback-%RANDOM%-%RANDOM%"
+mkdir "%WORK%" || exit /b 1
+set "WINDOWS="
+set "EFI="
+set "TEMP_EFI="
+set "BACKUP="
+set "CONFLICT="
+for %%D in (C D E F G H I J K L M N O P Q R S T U V W Y Z) do call :detect %%D:
+if defined CONFLICT goto wrong_volumes
+if not defined WINDOWS goto wrong_volumes
+if not defined BACKUP goto wrong_volumes
+if not defined EFI call :attach_efi
+if not defined EFI goto wrong_volumes
+if /i "%WINDOWS%"=="%BACKUP%" goto wrong_volumes
+if /i "%WINDOWS%"=="%EFI%" goto wrong_volumes
+if /i "%BACKUP%"=="%EFI%" goto wrong_volumes
+set "SNAPSHOT=%BACKUP%\WUO-Rollback\@@JOB@@"
+set "LOG=%SNAPSHOT%\restore.log"
+set "TOOLS=%~2"
+if not defined TOOLS set "TOOLS=%~dp0"
+if not exist "%TOOLS%certutil.exe" goto wrong_volumes
+if not exist "%TOOLS%findstr.exe" goto wrong_volumes
+@@PROTECTED_REQUIREMENTS@@
+if not exist "%SYS%\robocopy.exe" goto invalid_catalog
+if not exist "%SYS%\wbadmin.exe" goto invalid_catalog
+if not exist "%SNAPSHOT%\rollback.json" goto wrong_volumes
+set "VERIFY_ROOT=%SNAPSHOT%"
+call :verify_efi || goto invalid_backup
+for /f "delims=" %%F in ('dir /b /s /a:l "%SNAPSHOT%\EFI\Microsoft\Boot" 2^>nul') do goto invalid_backup
+set "BOOT_COUNT=0"
+for /f "delims=" %%F in ('dir /b /s /a:-d "%SNAPSHOT%\EFI\Microsoft\Boot" 2^>nul') do call :count_backup_file "%%~nxF"
+if not "%BOOT_COUNT%"=="@@BOOT_FILE_COUNT@@" goto invalid_backup
+"%SYS%\wbadmin.exe" get items "-version:@@VERSION@@" "-backupTarget:%BACKUP%" "-machine:@@COMPUTER@@" >"%WORK%\catalog.txt" 2>&1 || goto invalid_catalog
+if /i "%~1"=="check_backup" (
+    if not exist "%SNAPSHOT%\recovery\restore.cmd" goto invalid_catalog
+    echo Verified the rollback backup and recovery tools.
+    goto success
+)
+@@RESUME_CHECK@@
+set "VERIFY_ROOT=%WINDOWS%\Windows.old\Windows"
+call :load_identity @@SOURCE_BUILD@@ @@SOURCE_UBR@@ || goto @@PRE_SWAP_FAILURE@@
+set "VERIFY_ROOT=%WINDOWS%\Windows"
+@@REPLACEMENT_CHECK@@
+@@PRE_SWAP_BRANCH@@
+if /i "%~1"=="check" (
+    echo Feature rollback backup and Windows installation verified.
+    goto success
+)
+@@START_RESTORE@@
+"%SYS%\wbadmin.exe" start recovery "-version:@@VERSION@@" "-backupTarget:%BACKUP%" "-machine:@@COMPUTER@@" -itemtype:Volume -items:@@ORIGINAL_LETTER@@ "-recoveryTarget:%WINDOWS%" -quiet >>"%LOG%" 2>&1 || goto failed
+call :load_identity @@SOURCE_BUILD@@ @@SOURCE_UBR@@ || goto failed
+"%SYS%\robocopy.exe" "%SNAPSHOT%\EFI\Microsoft\Boot" "%EFI%\EFI\Microsoft\Boot" /MIR /COPY:DAT /DCOPY:DAT /R:0 /W:0 /XJ /XF BCD.LOG BCD.LOG1 BCD.LOG2 >>"%LOG%" 2>&1
+if errorlevel 8 goto failed
+for %%J in (BCD.LOG BCD.LOG1 BCD.LOG2) do if exist "%EFI%\EFI\Microsoft\Boot\%%J" (del /q "%EFI%\EFI\Microsoft\Boot\%%J" || goto failed)
+@@RESTORE_EXTRA@@
+set "VERIFY_ROOT=%EFI%"
+call :verify_efi || goto failed
+@@PROTECTED_QUEUE@@
+(>"%SNAPSHOT%\restore.done" echo @@JOB@@) || goto failed
+@@RESTORE_BOOT_ORDER@@
+echo The previous Windows installation and EFI files were restored.
+goto success
+
+@@PROTECTED_SUBROUTINES@@
+:detect
+set "VOLUME="
+"%SYS%\mountvol.exe" %~1\ /L >"%WORK%\volume.txt" 2>nul || exit /b 0
+for /f "usebackq tokens=1" %%I in ("%WORK%\volume.txt") do set "VOLUME=%%I"
+if /i "%VOLUME%"=="@@WINDOWS@@" call :found WINDOWS %~1
+if /i "%VOLUME%"=="@@EFI@@" call :found EFI %~1
+if /i "%VOLUME%"=="@@BACKUP@@" call :found BACKUP %~1
+exit /b 0
+
+:found
+if defined %~1 set "CONFLICT=1"
+set "%~1=%~2"
+exit /b 0
+
+:attach_efi
+for %%D in (Z Y W V U T S R Q P O N M L K J I H G F) do if not defined EFI call :try_efi %%D:
+exit /b 0
+
+:try_efi
+if exist "%~1\" exit /b 1
+"%SYS%\mountvol.exe" %~1\ @@EFI@@ >nul 2>&1 || exit /b 1
+set "TEMP_EFI=%~1"
+call :detect %~1
+exit /b 0
+
+:load_identity
+set "HIVE=HKLM\WUO_ROLLBACK_@@JOB@@"
+"%SYS%\reg.exe" load "%HIVE%" "%VERIFY_ROOT%\System32\Config\SOFTWARE" >nul 2>&1 || exit /b 1
+call :verify_identity %~1 %~2 %~3
+set "IDENTITY_EXIT=%ERRORLEVEL%"
+"%SYS%\reg.exe" unload "%HIVE%" >nul 2>&1 || exit /b 1
+exit /b %IDENTITY_EXIT%
+
+:verify_identity
+call :verify_value "%HIVE%\Microsoft\Cryptography" MachineGuid REG_SZ @@MACHINE@@ || exit /b 1
+set "VERSION_KEY=%HIVE%\Microsoft\Windows NT\CurrentVersion"
+call :verify_value "%VERSION_KEY%" CurrentBuildNumber REG_SZ %~1 || exit /b 1
+if /i not "%~2"=="any" call :verify_value "%VERSION_KEY%" UBR REG_DWORD %~2 || exit /b 1
+if not "%~3"=="" call :verify_value "%VERSION_KEY%" EditionID REG_SZ %~3 || exit /b 1
+exit /b 0
+
+:verify_pending
+"%SYS%\reg.exe" load "%HIVE%" "%VERIFY_ROOT%\System32\Config\SYSTEM" >nul 2>&1 || exit /b 1
+call :verify_value "%HIVE%\Setup" SystemSetupInProgress REG_DWORD 0x1
+set "PENDING_EXIT=%ERRORLEVEL%"
+"%SYS%\reg.exe" unload "%HIVE%" >nul 2>&1 || exit /b 1
+exit /b %PENDING_EXIT%
+
+:verify_value
+"%SYS%\reg.exe" query "%~1" /v "%~2" >"%WORK%\value.txt" 2>nul || exit /b 1
+for /f "usebackq tokens=1,2,*" %%A in ("%WORK%\value.txt") do if /i "%%A"=="%~2" if /i "%%B"=="%~3" if /i "%%C"=="%~4" exit /b 0
+exit /b 1
+
+:verify_efi
+@@VERIFY_FILES@@
+exit /b 0
+
+:count_backup_file
+if /i "%~1"=="BCD.LOG" exit /b 0
+if /i "%~1"=="BCD.LOG1" exit /b 0
+if /i "%~1"=="BCD.LOG2" exit /b 0
+set /a BOOT_COUNT+=1 >nul
+exit /b 0
+
+:verify_file
+if not exist "%VERIFY_ROOT%\%~1" exit /b 1
+"%TOOLS%certutil.exe" -hashfile "%VERIFY_ROOT%\%~1" SHA256 >"%WORK%\hash.txt" 2>&1 || exit /b 1
+"%TOOLS%findstr.exe" /x /i /c:"%~2" "%WORK%\hash.txt" >nul || exit /b 1
+exit /b 0
+
+:wrong_volumes
+echo Could not verify the Windows, EFI and backup volumes.
+goto unsuccessful
+:invalid_backup
+echo The EFI backup inventory could not be verified. Expected @@BOOT_FILE_COUNT@@ Windows boot files, counted %BOOT_COUNT%.
+goto unsuccessful
+:invalid_catalog
+echo Could not verify the Windows backup catalog or the recovery tools.
+goto unsuccessful
+:wrong_windows
+echo The Windows installation is outside the expected feature upgrade recovery phase.
+goto unsuccessful
+:interrupted
+echo A restore already started. Check "%LOG%" from independent recovery media.
+goto unsuccessful
+:failed
+echo Feature rollback failed. Review "%LOG%" before restarting.
+:unsuccessful
+set "RESULT=1"
+goto cleanup
+:success
+set "RESULT=0"
+:cleanup
+if defined TEMP_EFI "%SYS%\mountvol.exe" %TEMP_EFI%\ /D >nul 2>&1
+del /q "%WORK%\*.txt" >nul 2>&1
+rmdir "%WORK%" >nul 2>&1
+exit /b %RESULT%
