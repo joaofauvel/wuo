@@ -186,6 +186,42 @@ def test_protected_rollback_resumes_only_the_captured_job(
         assert checkpoint.read_bytes() == f"{marker}\r\n".encode("ascii")
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Runs the generated rollback commands")
+def test_protected_rollback_preserves_ventoy_receipt(
+    protected_restore: str, tmp_path: Path
+) -> None:
+    windows = tmp_path / "restored Windows"
+    job = windows / "ProgramData" / "WinOfflineUpdate" / "jobs" / str(JOB)
+    job.mkdir(parents=True)
+    (job / "feature_upgrade.ps1").touch()
+    (job / "boot-order.json").touch()
+    snapshot = tmp_path / "backup"
+    recovery = snapshot / "recovery"
+    recovery.mkdir(parents=True)
+    receipt = b'{\r\n  "original": null\r\n}\r\n'
+    (recovery / "ventoy-state.json").write_bytes(receipt)
+    start = protected_restore.index("\r\n:queue_boot_restore\r\n")
+    end = protected_restore.index("\r\n:detect\r\n", start)
+    command = tmp_path / "queue.cmd"
+    command.write_bytes(
+        (
+            '@echo off\r\nset "WORK=%~dp0"\r\n'
+            f'set "WINDOWS={windows}"\r\nset "SNAPSHOT={snapshot}"\r\n'
+            'set "LOG=%~dp0restore.log"\r\nset "TOOLS=%SystemRoot%\\System32\\"\r\n'
+            "call :queue_boot_restore || exit /b 1\r\nexit /b 0\r\n"
+            + protected_restore[start:end]
+        ).encode("ascii")
+    )
+    result = subprocess.run(
+        [os.environ["COMSPEC"], "/d", "/c", str(command)],
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert (job / "ventoy-state.json").read_bytes() == receipt
+    assert (job / "boot-rollback.id").read_bytes() == f"{JOB}\r\n".encode("ascii")
+
+
 @pytest.mark.skipif(POWERSHELL is None, reason="requires Windows PowerShell")
 @pytest.mark.parametrize("case", ["safeos", "extra-loader", "wrong-ramdisk"])
 def test_protected_stage_requires_a_single_verified_safeos_loader(case: str) -> None:

@@ -321,6 +321,9 @@ exit /b 0
 set "JOBROOT=%WINDOWS%\ProgramData\WinOfflineUpdate\jobs\{job}"
 if not exist "%JOBROOT%\feature_upgrade.ps1" exit /b 1
 if not exist "%JOBROOT%\boot-order.json" exit /b 1
+if exist "%SNAPSHOT%\recovery\ventoy-state.json" (
+    copy /b /y "%SNAPSHOT%\recovery\ventoy-state.json" "%JOBROOT%\ventoy-state.json" >>"%LOG%" 2>&1 || echo The Ventoy configuration receipt is still on the backup drive.
+)
 if not exist "%TOOLS%fc.exe" exit /b 1
 (>"%WORK%\expected-job.txt" echo {job}) || exit /b 1
 copy /b /y "%WORK%\expected-job.txt" "%JOBROOT%\boot-rollback.id" >>"%LOG%" 2>&1 || exit /b 1

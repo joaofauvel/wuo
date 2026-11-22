@@ -212,7 +212,7 @@ def test_feature_is_published_only_after_backup_and_deferred_setup(
     def select(_target: object, drive: str, backup: str) -> dict[str, object]:
         assert drive == "F:" and backup == "E:"
         events.append("identify")
-        return {"id": "Boot0001"}
+        return {"id": "Boot0001", "media_volume": "F:\\"}
 
     def prepare_recovery(
         _target: object,
@@ -229,6 +229,7 @@ def test_feature_is_published_only_after_backup_and_deferred_setup(
         assert not (system32 / "update" / "runonce" / job.name).exists()
         assert receipt == (job / "rollback.json").read_bytes()
         assert (backup_root / job.name / "recovery" / "restore.cmd").is_file()
+        (job / "ventoy-state.json").write_bytes(b"captured Ventoy configuration")
         events.append("prepare-recovery")
         return {"receipt": f"v1 {job.name} {'f' * 64} 26300"}
 
@@ -274,6 +275,9 @@ def test_feature_is_published_only_after_backup_and_deferred_setup(
             assert (job / "feature.protected").read_bytes() == marker
             request = json.loads((job / "feature.json").read_bytes())
             assert request["schema"] == 2
+            assert (
+                backup_root / job.name / "recovery" / "ventoy-state.json"
+            ).read_bytes() == (job / "ventoy-state.json").read_bytes()
             proof = job / "independent-preflight.done"
             with pytest.raises(
                 ValueError, match="Ventoy drive and wait for its preflight"
@@ -281,6 +285,60 @@ def test_feature_is_published_only_after_backup_and_deferred_setup(
                 _require_captured_feature_hook_support(job)
             proof.write_bytes(f"{request['recovery']['receipt']}\r\n".encode("ascii"))
             _require_captured_feature_hook_support(job)
+
+
+def test_status_restores_ventoy_after_verified_feature_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from uuid import UUID
+
+    from wuo import feature_ventoy, winre_menu
+
+    menu = winre_menu.Menu(
+        TargetIdentity("25H2", 26200, 9974, "x64", tmp_path / "Windows", OWNER, LOADER)
+    )
+    menu.root.mkdir(parents=True)
+    state = menu.job_state(JOB)
+    state.mkdir(parents=True)
+    volume = tmp_path / "usb"
+    config = volume / "ventoy" / "ventoy.json"
+    config.parent.mkdir(parents=True)
+    config.write_bytes(b"{}\n")
+    image = tmp_path / "recovery.iso"
+    image.write_bytes(b"recovery media")
+    receipt = state / "ventoy-state.json"
+    installed = feature_ventoy.deploy_recovery_iso(
+        volume, image, package_hashes(image)[0], UUID(JOB), receipt
+    )
+    (menu.root / "boot-order-last.id").write_bytes(f"{JOB}\r\n".encode("ascii"))
+    (state / "boot-completion.phase").write_bytes(b"rollback\r\n")
+    (state / "feature.json").write_text(
+        json.dumps(
+            {
+                "id": JOB,
+                "schema": 2,
+                "recovery": {"entry": {"media_volume": str(volume)}},
+            }
+        )
+    )
+    (state / "boot-order-result.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "order": "restored",
+                "order_detail": "verified",
+                "fallback": "unchanged",
+                "fallback_detail": "verified",
+            }
+        )
+    )
+    (menu.root / "installed.id").write_bytes(f"{OWNER}\r\n".encode("ascii"))
+    monkeypatch.setattr(menu, "describe_hooks", lambda: None)
+    monkeypatch.setattr("wuo.windows_updates.verify", lambda *_: None)
+    menu.status()
+    assert config.read_bytes() == b"{}\n"
+    assert not installed.exists()
+    assert not receipt.exists()
 
 
 @pytest.mark.parametrize(

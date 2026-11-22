@@ -289,12 +289,17 @@ class Menu:
                     asset.name: package_hashes(asset)[0] for asset in boot_assets
                 }
                 request = json.dumps(manifest, sort_keys=True).encode("ascii")
+            if recovery is not None:
+                manifest = json.loads(request)
+                manifest["recovery"] = {"entry": recovery}
+                request = json.dumps(manifest, sort_keys=True).encode("ascii")
             (job / "feature.json").write_bytes(request)
             if media.preserve_boot_order:
                 # A volume rollback must restore the task as well as the snapshot.
                 self._register_feature_task(str(job_id), continuation)
             marker = f"{job_id}\r\n".encode("ascii")
             receipt = None
+            rollback_snapshot = None
             if any(hook.phase == "pre" for hook in selected.hooks):
                 pre_hooks = job / "source-hooks.cmd"
                 pre_hooks.write_bytes(
@@ -313,7 +318,9 @@ class Menu:
                     hook_receipt_sha256 = sha256(
                         feature_recovery_receipt(job_id, image, selected.hooks)
                     ).hexdigest()
-                receipt, snapshot = backup_feature(self.target, job_id, backup_drive)
+                receipt, rollback_snapshot = backup_feature(
+                    self.target, job_id, backup_drive
+                )
                 runner = job / "restore.cmd"
                 runner.write_bytes(
                     render_feature_restore(
@@ -330,14 +337,28 @@ class Menu:
                 (job / "restore.sha256").write_bytes(
                     f"{package_hashes(runner)[0]}\r\n".encode("ascii")
                 )
-                self._export_feature_restore(snapshot, job, boot_assets=boot_assets)
+                self._export_feature_restore(
+                    rollback_snapshot, job, boot_assets=boot_assets
+                )
                 (job / "rollback.required").write_bytes(marker)
             if recovery is not None:
-                assert receipt is not None
+                assert receipt is not None and rollback_snapshot is not None
                 manifest = json.loads(request)
                 manifest["recovery"] = prepare_independent_recovery(
                     self.target, media, image, job, selected.hooks, recovery, receipt
                 )
+                ventoy_state = job / "ventoy-state.json"
+                try:
+                    shutil.copyfile(
+                        ventoy_state, rollback_snapshot / "recovery" / ventoy_state.name
+                    )
+                except OSError:
+                    from .feature_ventoy import restore_recovery_media
+
+                    restore_recovery_media(
+                        Path(str(recovery["media_volume"])), job_id, ventoy_state
+                    )
+                    raise
                 (job / "feature.json").write_bytes(
                     json.dumps(manifest, sort_keys=True).encode("ascii")
                 )
@@ -611,12 +632,12 @@ class Menu:
         return True
 
     @staticmethod
-    def _describe_boot_result(state: Path) -> bool:
+    def _describe_boot_result(state: Path) -> dict[str, object] | None:
         path = state / "boot-order-result.json"
         try:
             report = json.loads(path.read_bytes())
         except FileNotFoundError:
-            return False
+            return None
         if (
             not isinstance(report, dict)
             or report.get("schema") != 1
@@ -628,7 +649,34 @@ class Menu:
             raise ValueError(f"Invalid boot preservation result. Review {path}.")
         print(f"UEFI boot order {report['order']}. {report['order_detail']}")
         print(f"EFI fallback {report['fallback']}. {report['fallback_detail']}")
-        return True
+        return report
+
+    @staticmethod
+    def _restore_rollback_media(state: Path, report: dict[str, object]) -> None:
+        receipt = state / "ventoy-state.json"
+        phase = state / "boot-completion.phase"
+        if (
+            not receipt.is_file()
+            or not phase.is_file()
+            or phase.read_bytes() != b"rollback\r\n"
+        ):
+            return
+        if report["order"] not in {"restored", "unchanged"} or report[
+            "fallback"
+        ] not in {"restored", "unchanged", "absent"}:
+            return
+        request = json.loads((state / "feature.json").read_bytes())
+        if request.get("schema") != 2 or request.get("id") != state.name:
+            raise ValueError("The recovery media receipt belongs to a different job.")
+        media = Path(request["recovery"]["entry"]["media_volume"])
+        if not media.is_dir():
+            print(
+                "Reconnect the recovery drive and run wuo status to restore its Ventoy configuration."
+            )
+            return
+        from .feature_ventoy import restore_recovery_media
+
+        restore_recovery_media(media, UUID(state.name), receipt)
 
     def status(self) -> None:
         if not self.installed:
@@ -640,7 +688,9 @@ class Menu:
             job_id = self._pending_id()
             if job_id is None:
                 if latest := _read_id(self.root / "boot-order-last.id"):
-                    self._describe_boot_result(self.job_state(latest))
+                    state = self.job_state(latest)
+                    if report := self._describe_boot_result(state):
+                        self._restore_rollback_media(state, report)
                 print("No update staged.")
                 return
             if self._verify_completed(job_id):

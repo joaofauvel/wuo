@@ -7,6 +7,10 @@ a GPT Ventoy USB drive, and a separate NTFS backup drive. Wuo uses the
 generated recovery image to apply the captured post hooks before the upgraded
 Windows boots. Keep both drives connected through the upgrade.
 
+Firmware can try another boot entry if the recovery USB is unplugged or
+unavailable during startup. If protected recovery reports a failure, use its
+restore option before selecting Windows directly.
+
 If an older release installed your WinRE menu, finish any pending job,
 run `wuo remove`, and run `wuo setup` with your selected hooks again.
 
@@ -24,6 +28,13 @@ If independent recovery reports a failure, use the restore command shown
 there. It requires confirmation before restoring the saved Windows and EFI
 files. Before WinRE authorizes a protected job, `wuo status --discard` restores
 the prior Ventoy selection and retains the backup and logs.
+After rollback, keep Ventoy connected and run `wuo status` to restore its
+original configuration.
+
+Windows Backup warns about restoring with virtualization-based security enabled.
+Microsoft's UEFI revocation policy can prevent old backups or recovery media
+from booting. Check the recovery media and backup against your system's policy
+before starting. [Microsoft's VBS rollback guidance](https://support.microsoft.com/en-us/servicing/os/windows/2024/07/guidance-for-blocking-rollback-of-virtualization-based-security-vbs-related-security-updates)
 
 ## Compatibility preview
 
