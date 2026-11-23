@@ -18,18 +18,23 @@ run `wuo remove`, and run `wuo setup` with your selected hooks again.
 wuo update --only features --feature-iso $iso --iso-sha256 $sha256 --accept-setup-eula --backup-drive D: --recovery-drive E: --preserve-boot-order
 ```
 
-1. Wuo backs up Windows and EFI, builds the job's recovery image, and temporarily
-   selects it as Ventoy's default. Use the one-time UEFI boot menu to boot Ventoy
-   and let it select the generated image. Wait for the preflight result.
-2. Return to Windows and run `wuo update`. In WinRE, choose **Troubleshoot →
-   wuo** to authorize the staged job. After the upgrade, run `wuo status` in Windows.
+1. Save your work and run the command from administrator PowerShell. Wuo backs
+   up Windows and EFI, prepares the recovery image, and reports progress while
+   Windows Setup runs. Keep power and both drives connected.
+2. Wuo restarts automatically. The recovery image checks access to the original
+   Windows, EFI, and backup volumes, then exits and starts the offline phase
+   of Windows Setup. After Setup replaces Windows, the image runs again to
+   apply and verify the captured post hooks.
+3. Run `wuo status` when you return to Windows. It reports the upgrade result and
+   restores the original Ventoy configuration after a verified upgrade or rollback.
 
-If independent recovery reports a failure, use the restore command shown
-there. It requires confirmation before restoring the saved Windows and EFI
-files. Before WinRE authorizes a protected job, `wuo status --discard` restores
-the prior Ventoy selection and retains the backup and logs.
-After rollback, keep Ventoy connected and run `wuo status` to restore its
-original configuration.
+If the initial recovery check fails, Wuo returns to the original Windows when
+it can verify that the original loader is safe to start. If the post hooks
+fail after the swap, Wuo holds in recovery. Use the restore command shown
+there to restore the saved Windows and EFI files. Restore requires confirmation.
+`wuo status` clears an early failure when it can verify that Windows Setup is
+idle and the original boot order is restored. The backup and logs are kept.
+Use `wuo status --discard` to clear a staged job before Windows Setup starts.
 
 Windows Backup warns about restoring with virtualization-based security enabled.
 Microsoft's UEFI revocation policy can prevent old backups or recovery media

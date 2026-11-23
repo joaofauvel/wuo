@@ -15,12 +15,17 @@ set "RECOVERY_EFI_VOLUME=@@RECOVERY_EFI_VOLUME@@"
 set "BACKUP_VOLUME=@@BACKUP_VOLUME@@"
 set "WINDOWS_ENTRY=@@WINDOWS_ENTRY@@"
 set "RECOVERY_ENTRY=@@RECOVERY_ENTRY@@"
+set "START_IN_WINDOWS=@@START_IN_WINDOWS@@"
+set "ORIGINAL_BCD_HASH=@@ORIGINAL_BCD_HASH@@"
+set "SAFEOS_RELATIVE=\$WINDOWS.~BT\Sources\SafeOS\winre.wim"
 set "LETTERS=A B C D E F G H I J K L M N O P Q R S T U V W Y Z"
 set "MODE=%~1"
 set "TARGET="
 set "EFI="
 set "RECOVERY_EFI="
 set "BACKUP="
+set "SNAPSHOT="
+set "BCD="
 set "TEMP_EFI="
 set "TEMP_RECOVERY_EFI="
 set "CONFLICT="
@@ -30,6 +35,8 @@ set "FIRMWARE_UNCERTAIN="
 set "OWN_WORK="
 set "RESUMING="
 set "PREVIOUSLY_VERIFIED="
+set "AUTO_PREFLIGHT="
+set "NATIVE_SETUP_ENTERED="
 set "PHASE=independent-post"
 set "HOOK_HIVE=HKLM\WUO_POST_@@JOB@@"
 set "ID_HIVE=HKLM\WUO_ID_@@JOB@@"
@@ -71,6 +78,7 @@ call :plain_dir "%JOB%" || goto stopped
 :target_volume
 call :read_mount %TARGET% || goto stopped
 if /i not "%VOLUME%"=="%WINDOWS_VOLUME%" goto stopped
+if defined START_IN_WINDOWS if not defined MODE if not exist "%JOB%\safeos.ready" set "AUTO_PREFLIGHT=1"
 set "STEP=open the independent recovery log"
 if not defined RESUMING call :persist_log || goto stopped
 
@@ -93,15 +101,20 @@ if defined RESUMING (
 
 if /i "%MODE%"=="check" goto check_restore
 if /i "%MODE%"=="restore" goto manual_restore
+if defined AUTO_PREFLIGHT goto windows_preflight
+if defined START_IN_WINDOWS if /i "%MODE%"=="preflight" goto stopped
 if /i "%MODE%"=="preflight" goto preflight
-if not exist "%JOB%\claimed.id" if not exist "%JOB%\safeos.ready" goto preflight
+if not defined START_IN_WINDOWS if not exist "%JOB%\claimed.id" if not exist "%JOB%\safeos.ready" goto preflight
 
 set "STEP=verify the job's Setup handoff markers"
 call :hash_is "%JOB%\claimed.id" %MARKER_HASH% || goto stopped
 call :hash_is "%JOB%\safeos.ready" %MARKER_HASH% || goto stopped
+set "NATIVE_SETUP_ENTERED=1"
 call :hash_is "%JOB%\precommit.done" %MARKER_HASH% || goto stopped
 call :hash_is "%JOB%\independent-preflight.done" %RECEIPT_HASH% || goto stopped
 if exist "%JOB%\precommit.failed" goto stopped
+if exist "%JOB%\protected-preflight.failed" goto stopped
+if exist "%JOB%\safeos-preflight.blocked" goto stopped
 if exist "%JOB%\independent-hooks.done" call :hash_is "%JOB%\independent-hooks.done" %RECEIPT_HASH% || goto stopped
 if exist "%JOB%\independent-hooks.done" set "PREVIOUSLY_VERIFIED=1"
 set "STEP=verify the retained original Windows and the replacement Windows build"
@@ -135,6 +148,32 @@ call :sync_firmware || goto stopped
 set "STEP=write and read back the independent recovery preflight receipt"
 call :record_receipt "%JOB%\independent-preflight.done" || goto stopped
 echo Independent recovery verified the original Windows, EFI and backup. Return to the original Windows to continue.
+goto success
+
+:windows_preflight
+echo Wuo is verifying the backup and Windows Setup before continuing to SafeOS.
+set "STEP=verify the staged Setup handoff markers"
+call :hash_is "%JOB%\claimed.id" %MARKER_HASH% || goto stopped
+call :hash_is "%JOB%\precommit.done" %MARKER_HASH% || goto stopped
+if exist "%JOB%\precommit.failed" goto stopped
+if exist "%JOB%\protected-preflight.failed" goto stopped
+if exist "%JOB%\safeos-preflight.blocked" (
+    set "STEP=confirm that SafeOS accepted the independent recovery receipt"
+    goto stopped
+)
+set "STEP=verify the original Windows installation"
+call :load_identity "%TARGET%\Windows" @@SOURCE_BUILD@@ @@SOURCE_REVISION@@ || goto stopped
+set "STEP=verify recovery-first firmware and the queued native SafeOS loader"
+call :sync_firmware || goto stopped
+call :require_idle_firmware || goto stopped
+call :queued_safeos || goto stopped
+set "STEP=verify the staged native SafeOS image"
+call :verify_staged_safeos || goto stopped
+set "STEP=write and read back the independent recovery preflight receipt"
+call :record_receipt "%JOB%\independent-preflight.done" || goto stopped
+echo Wuo verified the original Windows, backup and SafeOS. Restarting into Windows Setup.
+>>"%LOG%" echo Verified the independent preflight. Restarting into native SafeOS.
+call :boot_windows_once || goto stopped
 goto success
 
 :check_restore
@@ -177,14 +216,37 @@ set "STEP=verify the same firmware recovery and Windows entries before reboot"
 call :sync_firmware || goto stopped
 call :require_idle_firmware || goto stopped
 call :target_loader || goto stopped
+call :boot_windows_once || goto stopped
+goto success
+
+:boot_windows_once
 set "STEP=write and verify the one-time Windows firmware selection"
 set "CAN_CANCEL=1"
-"%SYS%\bcdedit.exe" /set {fwbootmgr} bootsequence %WINDOWS_ENTRY% >>"%LOG%" 2>&1 || goto stopped
-call :firmware_order || goto stopped
-if /i not "%SEQUENCE%"=="%WINDOWS_ENTRY%" goto stopped
+"%SYS%\bcdedit.exe" /set {fwbootmgr} bootsequence %WINDOWS_ENTRY% >>"%LOG%" 2>&1 || exit /b 1
+call :firmware_order || exit /b 1
+if /i not "%SEQUENCE%"=="%WINDOWS_ENTRY%" exit /b 1
 set "STEP=reboot into the verified Windows installation"
-"%SYS%\wpeutil.exe" reboot || goto stopped
-goto success
+"%SYS%\wpeutil.exe" reboot
+exit /b
+
+:return_original_windows
+if not defined SNAPSHOT exit /b 1
+if not defined ORIGINAL_BCD_HASH exit /b 1
+if defined FIRMWARE_UNCERTAIN exit /b 1
+if exist "%JOB%\safeos.ready" exit /b 1
+call :hash_is "%JOB%\claimed.id" %MARKER_HASH% || exit /b 1
+call :hash_is "%JOB%\precommit.done" %MARKER_HASH% || exit /b 1
+call :load_identity "%TARGET%\Windows" @@SOURCE_BUILD@@ @@SOURCE_REVISION@@ || exit /b 1
+call :plain_file "%TARGET%\Windows\System32\winload.efi" || exit /b 1
+call :sync_firmware || exit /b 1
+call :require_idle_firmware || exit /b 1
+call :capture_original_loader || exit /b 1
+call :clear_safeos_queue || exit /b 1
+call :record_proof "%JOB%\protected-preflight.failed" "%WORK%\marker.txt" %MARKER_HASH% || exit /b 1
+echo Wuo cleared the staged Setup boot. Restarting the original Windows to report the failure.
+>>"%LOG%" echo Returning to the original Windows after a failed independent preflight.
+call :boot_windows_once
+exit /b
 
 :find_target
 set "MARKER=%~1%RELATIVE_JOB%\target.id"
@@ -355,12 +417,20 @@ if defined SEQUENCE exit /b 1
 exit /b 0
 
 :target_loader
-"%SYS%\bcdedit.exe" /store "%BCD%" /enum {bootmgr} /v >"%WORK%\bcd.txt" 2>>"%LOG%" || exit /b 1
-call :read_sequence || exit /b 1
+call :read_boot_manager "%BCD%" || exit /b 1
 if not defined SEQUENCE call :bcd_field default
 if not defined SEQUENCE call :guid_value FIELD SEQUENCE || exit /b 1
-"%SYS%\bcdedit.exe" /store "%BCD%" /enum %SEQUENCE% /v >"%WORK%\bcd.txt" 2>>"%LOG%" || exit /b 1
-call :bcd_value identifier %SEQUENCE% || exit /b 1
+call :normal_loader %SEQUENCE%
+exit /b
+
+:read_boot_manager
+"%SYS%\bcdedit.exe" /store "%~1" /enum {bootmgr} /v >"%WORK%\bcd.txt" 2>>"%LOG%" || exit /b 1
+call :read_sequence
+exit /b
+
+:normal_loader
+"%SYS%\bcdedit.exe" /store "%BCD%" /enum %~1 /v >"%WORK%\bcd.txt" 2>>"%LOG%" || exit /b 1
+call :bcd_value identifier %~1 || exit /b 1
 call :bcd_value device "partition=%TARGET%" || exit /b 1
 call :bcd_value osdevice "partition=%TARGET%" || exit /b 1
 call :bcd_value path "\Windows\System32\winload.efi" || exit /b 1
@@ -369,6 +439,76 @@ call :bcd_field winpe
 setlocal EnableDelayedExpansion
 if defined FIELD if /i not "!FIELD!"=="No" exit /b 1
 exit /b 0
+
+:queued_safeos
+call :read_boot_manager "%BCD%" || exit /b 1
+if not defined SEQUENCE exit /b 1
+call :queued_safeos_loader
+exit /b
+
+:queued_safeos_loader
+"%SYS%\bcdedit.exe" /store "%BCD%" /enum %SEQUENCE% /v >"%WORK%\bcd.txt" 2>>"%LOG%" || exit /b 1
+call :bcd_value identifier %SEQUENCE% || exit /b 1
+call :verify_safeos_loader
+exit /b
+
+:verify_safeos_loader
+call :bcd_field device
+setlocal EnableDelayedExpansion
+set "RAMDISK_OPTIONS="
+for /f "tokens=1,* delims=," %%A in ("!FIELD!") do set "RAMDISK_OPTIONS=%%B"
+call :guid_value RAMDISK_OPTIONS RAMDISK_ID || exit /b 1
+set "SAFEOS_DEVICE=ramdisk=[%TARGET%]%SAFEOS_RELATIVE%,!RAMDISK_ID!"
+if /i not "!FIELD!"=="!SAFEOS_DEVICE!" exit /b 1
+call :bcd_field osdevice
+if /i not "!FIELD!"=="!SAFEOS_DEVICE!" exit /b 1
+call :bcd_value path "\Windows\System32\winload.efi" || exit /b 1
+call :bcd_value winpe Yes
+exit /b
+
+:verify_staged_safeos
+call :plain_dir "%TARGET%\$WINDOWS.~BT" || exit /b 1
+call :plain_dir "%TARGET%\$WINDOWS.~BT\Sources" || exit /b 1
+call :plain_dir "%TARGET%\$WINDOWS.~BT\Sources\SafeOS" || exit /b 1
+call :plain_file "%JOB%\safeos.sha256" || exit /b 1
+call :hash "%TARGET%%SAFEOS_RELATIVE%" || exit /b 1
+(>"%WORK%\safeos.sha256" echo(%HASH%) || exit /b 1
+"%TOOLS%fc.exe" /b "%WORK%\safeos.sha256" "%JOB%\safeos.sha256" >>"%LOG%" 2>&1
+exit /b
+
+:capture_original_loader
+call :plain_dir "%BACKUP%\WUO-Rollback" || exit /b 1
+call :plain_dir "%SNAPSHOT%" || exit /b 1
+call :plain_dir "%SNAPSHOT%\EFI" || exit /b 1
+call :plain_dir "%SNAPSHOT%\EFI\Microsoft" || exit /b 1
+call :plain_dir "%SNAPSHOT%\EFI\Microsoft\Boot" || exit /b 1
+call :plain_file "%SNAPSHOT%\EFI\Microsoft\Boot\BCD" || exit /b 1
+copy /b "%SNAPSHOT%\EFI\Microsoft\Boot\BCD" "%WORK%\original.bcd" >nul || exit /b 1
+call :hash_is "%WORK%\original.bcd" %ORIGINAL_BCD_HASH% || exit /b 1
+call :read_boot_manager "%WORK%\original.bcd" || exit /b 1
+if defined SEQUENCE exit /b 1
+call :bcd_field default
+call :guid_value FIELD ORIGINAL_LOADER || exit /b 1
+"%SYS%\bcdedit.exe" /store "%WORK%\original.bcd" /enum %ORIGINAL_LOADER% /v >"%WORK%\original-loader.txt" 2>>"%LOG%"
+exit /b
+
+:compare_original_loader
+call :normal_loader %ORIGINAL_LOADER% || exit /b 1
+"%TOOLS%fc.exe" /b "%WORK%\original-loader.txt" "%WORK%\bcd.txt" >>"%LOG%" 2>&1
+exit /b
+
+:clear_safeos_queue
+call :compare_original_loader || exit /b 1
+call :read_boot_manager "%BCD%" || exit /b 1
+call :bcd_value default %ORIGINAL_LOADER% || exit /b 1
+if not defined SEQUENCE exit /b 0
+call :queued_safeos_loader || exit /b 1
+"%SYS%\bcdedit.exe" /store "%BCD%" /deletevalue {bootmgr} bootsequence >>"%LOG%" 2>&1 || exit /b 1
+call :read_boot_manager "%BCD%" || exit /b 1
+if defined SEQUENCE exit /b 1
+call :bcd_value default %ORIGINAL_LOADER% || exit /b 1
+call :compare_original_loader
+exit /b
 
 :bcd_field
 set "FIELD="
@@ -414,16 +554,20 @@ endlocal & set "%~2=%GUID%"
 exit /b 0
 
 :record_receipt
+call :record_proof "%~1" "%WORK%\receipt.txt" %RECEIPT_HASH%
+exit /b
+
+:record_proof
 if exist "%~1" (
-    call :hash_is "%~1" %RECEIPT_HASH%
+    call :hash_is "%~1" %~3
     exit /b
 )
 set "DRAFT=%~1.%RANDOM%-%RANDOM%.tmp"
 if exist "%DRAFT%" exit /b 1
-copy /b "%WORK%\receipt.txt" "%DRAFT%" >nul || exit /b 1
-call :hash_is "%DRAFT%" %RECEIPT_HASH% || exit /b 1
+copy /b "%~2" "%DRAFT%" >nul || exit /b 1
+call :hash_is "%DRAFT%" %~3 || exit /b 1
 ren "%DRAFT%" "%~nx1" || exit /b 1
-call :hash_is "%~1" %RECEIPT_HASH%
+call :hash_is "%~1" %~3
 exit /b
 
 :plain_dir
@@ -490,15 +634,26 @@ exit /b 0
 @@HOOK_HELPERS@@
 
 :stopped
+echo Independent recovery stopped. Could not %STEP%.
+if defined LOG >>"%LOG%" echo Independent recovery stopped. Could not %STEP%.
 if defined CAN_CANCEL (
     call :cancel_windows_boot || set "FIRMWARE_UNCERTAIN=1"
 )
-echo Independent recovery stopped. Could not %STEP%.
-if defined LOG >>"%LOG%" echo Independent recovery stopped. Could not %STEP%.
+set "CAN_CANCEL="
+if defined AUTO_PREFLIGHT (
+    call :return_original_windows && goto success
+    echo Could not verify an automatic return to the original Windows. Stay in recovery.
+    if defined LOG >>"%LOG%" echo Could not verify an automatic return to the original Windows.
+)
+if defined CAN_CANCEL (
+    call :cancel_windows_boot || set "FIRMWARE_UNCERTAIN=1"
+)
 if defined FIRMWARE_UNCERTAIN echo The one-time firmware selection is unresolved. Stay in recovery.
 if defined LOG if /i "%LOG%"=="%WORK%\recovery.log" type "%LOG%"
 if defined LOG if /i not "%LOG%"=="%WORK%\recovery.log" echo Recovery log "%LOG%"
 echo Windows Setup logs are in the Panther and Rollback folders under $WINDOWS.~BT\Sources.
+if defined NATIVE_SETUP_ENTERED echo SafeOS already released native Setup. Stay in recovery until the installation or rollback is verified.
+echo To retry verifying the upgrade and applying the captured hooks, run "%~f0".
 echo For a post-swap backup check, run "%~f0" check
 echo To restore the previous Windows and EFI after a successful check, run "%~f0" restore
 echo For a pre-swap failure, keep this recovery media available and inspect the original Windows and EFI before resuming.

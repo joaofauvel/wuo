@@ -35,6 +35,10 @@ call :check_available || goto stop
 "%SYS%\bcdedit.exe" /enum {fwbootmgr} /v >"%WORK%\manager.txt" 2>&1 || goto stop
 call :check_order || goto stop
 call :check_next || goto stop
+if "@@REQUIRE_PREFLIGHT@@"=="1" (
+    >>"%LOG%" echo Checking the independent recovery receipt before native SafeOS
+    call :verify_preflight_receipt || goto preflight_blocked
+)
 if not exist "%JOB%\safeos.ready" (
     (>"%JOB%\safeos.tmp" echo @@JOB@@) || goto stop
     ren "%JOB%\safeos.tmp" safeos.ready || goto stop
@@ -42,15 +46,46 @@ if not exist "%JOB%\safeos.ready" (
 call :match_job "%JOB%\safeos.ready" || goto stop
 >>"%LOG%" echo Verified recovery-first order and the one-time recovery selection
 start "" /wait X:\sources\recovery\recenv.exe
-if errorlevel 1 goto stop
+if errorlevel 1 (
+    >>"%LOG%" echo Native Windows Setup reported a failure after the SafeOS handoff.
+    echo Native Windows Setup reported a failure. Use independent recovery to inspect the installation and check whether rollback is available.
+    goto stop
+)
 wpeutil reboot
 exit /b 0
+
+:preflight_blocked
+>>"%LOG%" echo The independent recovery receipt is missing or invalid. Native Setup was held.
+if exist "%JOB%\safeos.ready" goto stop
+set "BLOCKED=%JOB%\safeos-preflight.blocked"
+(>"%WORK%\blocked.txt" echo(@@JOB@@) || goto stop
+if not exist "%BLOCKED%" (
+    set "BLOCKED_TMP=safeos-preflight.%RANDOM%-%RANDOM%.tmp"
+    call :record_blocked || goto stop
+)
+"%SYS%\fc.exe" /b "%WORK%\blocked.txt" "%BLOCKED%" >nul 2>&1 || goto stop
+>>"%LOG%" echo Returning to independent recovery to verify the original Windows boot
+echo Wuo held native Setup. Returning to independent recovery.
+wpeutil reboot || goto stop
+exit /b 1
 
 :stop
 if defined LOG >>"%LOG%" echo SafeOS could not verify the recovery handoff. Native Setup was held.
 echo Wuo could not verify the recovery handoff. Recovery remains selected.
 wpeutil shutdown
 exit /b 1
+
+:verify_preflight_receipt
+(>"%WORK%\preflight.txt" echo(@@PREFLIGHT_RECEIPT@@) || exit /b 1
+"%SYS%\fc.exe" /b "%WORK%\preflight.txt" "%JOB%\independent-preflight.done" >nul 2>&1 || exit /b 1
+exit /b 0
+
+:record_blocked
+if exist "%JOB%\%BLOCKED_TMP%" exit /b 1
+copy /b "%WORK%\blocked.txt" "%JOB%\%BLOCKED_TMP%" >nul || exit /b 1
+"%SYS%\fc.exe" /b "%WORK%\blocked.txt" "%JOB%\%BLOCKED_TMP%" >nul 2>&1 || exit /b 1
+ren "%JOB%\%BLOCKED_TMP%" safeos-preflight.blocked
+exit /b
 
 :check_order
 for /f "usebackq tokens=1,2" %%A in ("%WORK%\manager.txt") do if /i "%%A"=="displayorder" if /i "%%B"=="%RECOVERY%" exit /b 0

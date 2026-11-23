@@ -245,7 +245,13 @@ class Menu:
             media = replace(media, iso=media.iso.resolve(strict=True))
             job_id = uuid4()
             job = self.job_state(str(job_id))
-            callback_dir = self.target.windows / "System32/update/runonce" / str(job_id)
+            callbacks = self.target.windows / "System32/update/runonce"
+            for path, archive in self._abandoned_feature_callbacks(
+                callbacks, str(job_id)
+            ):
+                path.rename(archive)
+                print(f"Archived the abandoned Setup callbacks at {archive}.")
+            callback_dir = callbacks / str(job_id)
             request, callback = feature_setup_assets(
                 job_id, self.target, media, image, selected.hooks
             )
@@ -296,7 +302,12 @@ class Menu:
             (job / "feature.json").write_bytes(request)
             if media.preserve_boot_order:
                 # A volume rollback must restore the task as well as the snapshot.
-                self._register_feature_task(str(job_id), continuation)
+                if media.start_in_windows:
+                    self._register_feature_task(
+                        str(job_id), continuation, start_in_windows=True
+                    )
+                else:
+                    self._register_feature_task(str(job_id), continuation)
             marker = f"{job_id}\r\n".encode("ascii")
             receipt = None
             rollback_snapshot = None
@@ -304,13 +315,25 @@ class Menu:
                 pre_hooks = job / "source-hooks.cmd"
                 pre_hooks.write_bytes(
                     render_feature_source_hooks(
-                        selected.hooks, rollback=media.rollback
+                        selected.hooks,
+                        rollback=media.rollback,
+                        live=media.start_in_windows,
                     ).encode("ascii")
                 )
+                digest = package_hashes(pre_hooks)[0]
                 (job / "source-hooks.sha256").write_bytes(
-                    f"{package_hashes(pre_hooks)[0]}\r\n".encode("ascii")
+                    f"{digest}\r\n".encode("ascii")
                 )
+                if media.start_in_windows:
+                    manifest = json.loads(request)
+                    manifest["source_hooks_sha256"] = digest
+                    request = json.dumps(manifest, sort_keys=True).encode("ascii")
             if media.rollback and backup_drive is not None:
+                if media.start_in_windows:
+                    print(
+                        "Creating and verifying the Windows and EFI rollback backup.",
+                        flush=True,
+                    )
                 hook_receipt_sha256 = ""
                 if recovery is not None:
                     from .feature_recovery import feature_recovery_receipt
@@ -343,6 +366,8 @@ class Menu:
                 (job / "rollback.required").write_bytes(marker)
             if recovery is not None:
                 assert receipt is not None and rollback_snapshot is not None
+                if media.start_in_windows:
+                    print("Building the Ventoy recovery image.", flush=True)
                 manifest = json.loads(request)
                 manifest["recovery"] = prepare_independent_recovery(
                     self.target, media, image, job, selected.hooks, recovery, receipt
@@ -420,7 +445,9 @@ class Menu:
                 shutil.copyfile(source, draft / source.name)
             draft.rename(snapshot / "recovery")
 
-    def _register_feature_task(self, job: str, continuation: Path) -> None:
+    def _register_feature_task(
+        self, job: str, continuation: Path, *, start_in_windows: bool = False
+    ) -> None:
         system32 = self.target.windows / "System32"
         powershell = system32 / "WindowsPowerShell/v1.0/powershell.exe"
         arguments = subprocess.list2cmdline(
@@ -435,13 +462,19 @@ class Menu:
                 job,
             ]
         )
+        settings = (
+            "  <Settings><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"
+            "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries></Settings>\n"
+            if start_in_windows
+            else ""
+        )
         # /TR can truncate the combined command line, including the job ID.
         definition = f"""\
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <Triggers><BootTrigger /></Triggers>
   <Principals><Principal id="System"><UserId>S-1-5-18</UserId></Principal></Principals>
-  <Actions Context="System">
+{settings}  <Actions Context="System">
     <Exec>
       <Command>{escape(str(powershell))}</Command>
       <Arguments>{escape(arguments)}</Arguments>
@@ -464,6 +497,44 @@ class Menu:
                     task_file,
                 ]
             )
+
+    def start_protected_feature(self, job: Path) -> None:
+        """Authorize the staged job and launch its existing LocalSystem task."""
+        job_id = _id(job.name)
+        with self._lock():
+            self._require_windows_complete_locked()
+            if (
+                self._pending_id() != job_id
+                or job != self.job_state(job_id)
+                or job.resolve() != job
+                or _read_id(job / "feature.ready") != job_id
+                or _read_id(job / "feature.protected") != job_id
+                or (job / "claimed.id").exists()
+            ):
+                raise ValueError("The protected feature job changed. Run wuo status.")
+            request = json.loads((job / "feature.json").read_bytes())
+            if (
+                request.get("schema") != 2
+                or request.get("id") != job_id
+                or request.get("machine") != self.target.machine_guid
+                or request.get("start_in_windows") is not True
+            ):
+                raise ValueError("The job is not authorized to start from Windows.")
+            authorized = job / "authorized.id"
+            with authorized.open("xb") as marker:
+                marker.write(f"{job_id}\r\n".encode("ascii"))
+            try:
+                _run(
+                    [
+                        self.target.windows / "System32/schtasks.exe",
+                        "/Run",
+                        "/TN",
+                        f"wuo-feature-{job_id}",
+                    ]
+                )
+            except OSError, ValueError:
+                authorized.unlink(missing_ok=True)
+                raise
 
     def publish(self, source: Path) -> Path:
         with self._lock():
@@ -699,6 +770,28 @@ class Menu:
             state = self.job_state(job_id)
             if (state / "feature.ready").is_file():
                 boot_reported = self._describe_boot_result(state)
+                protected = (state / "feature.protected").is_file()
+                direct = (
+                    protected
+                    and json.loads((state / "feature.json").read_bytes()).get(
+                        "start_in_windows"
+                    )
+                    is True
+                )
+                if direct and _read_id(state / "protected-preflight.failed") == job_id:
+                    print(
+                        "The automatic recovery check stopped before the Windows swap. "
+                        f"Recovery log: {state / 'independent-recovery.log'}."
+                    )
+                    self._report_protected_failure_cleanup(job_id)
+                    return
+                error = state / "windows-start-error.log"
+                if direct and error.is_file():
+                    print(
+                        f"The Windows phase of the feature upgrade stopped. Log: {error}."
+                    )
+                    self._report_protected_failure_cleanup(job_id)
+                    return
                 if _read_id(state / "precommit.failed") == job_id:
                     print(
                         f"Setup stopped at the precommit check. The original Windows is active. Log: {state / 'precommit.log'}"
@@ -713,14 +806,19 @@ class Menu:
                         print(
                             f"Windows Setup stopped before completing the feature upgrade. Review {state}."
                         )
-                        print(
-                            "Check whether you can reuse the backup with wuo retry-feature --dry-run."
-                        )
+                        if not protected:
+                            print(
+                                "Check whether you can reuse the backup with wuo retry-feature --dry-run."
+                            )
                     else:
                         print(
                             f"Windows Setup completed its feature job. Review {state}."
                         )
                 elif (state / "claimed.id").is_file():
+                    if direct:
+                        from .feature_upgrade import feature_setup_progress
+
+                        print(feature_setup_progress(self.target, state))
                     log = (
                         "protected-stage.log"
                         if (state / "feature.protected").is_file()
@@ -729,6 +827,15 @@ class Menu:
                     print(
                         f"Windows Setup started the feature upgrade. Review {state / log}."
                     )
+                elif direct:
+                    if _read_id(state / "authorized.id") == job_id:
+                        print(
+                            "Windows Setup has been requested. Check wuo status for the result."
+                        )
+                    else:
+                        print(
+                            "Setup did not start. Clear the staged job with wuo status --discard before retrying."
+                        )
                 else:
                     authorized = (state / "authorized.id").is_file()
                     backup_check = state / "backup-check.log"
@@ -961,42 +1068,67 @@ class Menu:
             archives.append((path, archive))
         return archives
 
-    def discard(self) -> None:
-        with self._lock():
-            job_id = self._pending_id()
-            if (
-                job_id is not None
-                and (self.job_state(job_id) / "feature.ready").is_file()
+    def _report_protected_failure_cleanup(self, job_id: str) -> None:
+        try:
+            self._discard_locked(job_id)
+        except (OSError, ValueError) as error:
+            print(f"The pending job is retained. {error}")
+        else:
+            print("Cleared the failed job. Its logs and rollback backup are retained.")
+
+    def _discard_locked(self, job_id: str | None) -> None:
+        if job_id is not None and (self.job_state(job_id) / "feature.ready").is_file():
+            state = self.job_state(job_id)
+            if _read_id(state / "feature.protected") != job_id:
+                raise ValueError(
+                    "The feature upgrade may have native Setup state. Review wuo status before clearing it."
+                )
+            request = json.loads((state / "feature.json").read_bytes())
+            if request.get("schema") != 2 or request.get("id") != job_id:
+                raise ValueError("The protected feature job could not be verified.")
+            if any(
+                (state / name).exists()
+                for name in ("authorized.id", "claimed.id", "safeos.ready")
             ):
-                state = self.job_state(job_id)
-                if _read_id(state / "feature.protected") != job_id or any(
-                    (state / name).exists()
-                    for name in ("authorized.id", "claimed.id", "safeos.ready")
+                if (
+                    request.get("start_in_windows") is not True
+                    or _read_id(state / "claimed.id") != job_id
                 ):
                     raise ValueError(
                         "The feature upgrade may have native Setup state. Review wuo status before clearing it."
                     )
-                request = json.loads((state / "feature.json").read_bytes())
-                if request.get("schema") != 2 or request.get("id") != job_id:
-                    raise ValueError("The protected feature job could not be verified.")
-                from .feature_ventoy import restore_recovery_media
+                from .feature_upgrade import check_failed_protected_feature
 
-                restore_recovery_media(
-                    Path(request["recovery"]["entry"]["media_volume"]),
-                    UUID(job_id),
-                    state / "ventoy-state.json",
+                check_failed_protected_feature(self.target, job_id)
+                _run(
+                    [
+                        self.target.windows / "System32/schtasks.exe",
+                        "/Change",
+                        "/TN",
+                        f"wuo-feature-{job_id}",
+                        "/Disable",
+                    ]
                 )
-                callbacks = self.target.windows / "System32/update/runonce" / job_id
-                if callbacks.is_dir():
-                    _check_callback(
-                        callbacks / "precommit.cmd", request["callback_sha256"]
+            from .feature_ventoy import restore_recovery_media
+
+            callbacks = self.target.windows / "System32/update/runonce" / job_id
+            if callbacks.is_dir():
+                _check_callback(callbacks / "precommit.cmd", request["callback_sha256"])
+                if state.resolve() != state or callbacks.resolve() != callbacks:
+                    raise ValueError(
+                        "The protected job uses an unexpected callback path."
                     )
-                    if state.resolve() != state or callbacks.resolve() != callbacks:
-                        raise ValueError(
-                            "The protected job uses an unexpected callback path."
-                        )
-                    callbacks.rename(state / "archived-setup-callbacks")
-            (self.root / "pending.id").unlink(missing_ok=True)
+                callbacks.rename(state / "archived-setup-callbacks")
+            restore_recovery_media(
+                Path(request["recovery"]["entry"]["media_volume"]),
+                UUID(job_id),
+                state / "ventoy-state.json",
+            )
+        (self.root / "pending.id").unlink(missing_ok=True)
+
+    def discard(self) -> None:
+        with self._lock():
+            self._discard_locked(self._pending_id())
         print("Pending job cleared. Its files and logs are retained.")
 
     def resume(
@@ -1033,9 +1165,12 @@ class Menu:
                 return True
             state = self.job_state(job_id)
             if (state / "feature.ready").is_file():
-                if require_boot_preservation:
+                protected = (state / "feature.protected").is_file()
+                if protected or require_boot_preservation:
                     request = json.loads((state / "feature.json").read_bytes())
-                    if not request.get("boot_preservation"):
+                    if require_boot_preservation and not request.get(
+                        "boot_preservation"
+                    ):
                         raise ValueError(
                             "This feature upgrade was staged without boot preservation. "
                             "Keep the staged job and its backup. Run wuo status to review it."
@@ -1047,6 +1182,10 @@ class Menu:
                         "The feature upgrade has already been authorized. Run wuo status."
                     )
                     return False
+                if protected and request.get("start_in_windows") is True:
+                    raise ValueError(
+                        "Windows Setup did not start. Clear the staged job with wuo status --discard before retrying."
+                    )
                 _require_captured_feature_hook_support(state)
             if (state / "apply.started").exists():
                 raise ValueError(

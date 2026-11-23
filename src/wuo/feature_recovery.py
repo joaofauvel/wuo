@@ -93,6 +93,8 @@ def render_feature_recovery(
     restore_sha256: str,
     rollback_sha256: str,
     windows_entry: str = "{9dea862c-5cdd-4e70-acc1-f32b344d4795}",
+    start_in_windows: bool = False,
+    original_bcd_sha256: str = "",
 ) -> bytes:
     """Render the per-job independent stock WinRE startup script."""
     windows, efi, backup, recovery_efi = map(
@@ -118,6 +120,8 @@ def render_feature_recovery(
         raise ValueError(
             "The captured rollback manifest and recovery loaders need SHA-256 digests."
         )
+    if original_bcd_sha256 and not fullmatch(r"[0-9a-fA-F]{64}", original_bcd_sha256):
+        raise ValueError("The captured Windows BCD needs a SHA-256 digest.")
     if (
         not 0 < owner.build < image.build <= 0x7FFFFFFF
         or not 0 <= owner.revision <= 0xFFFFFFFF
@@ -162,6 +166,8 @@ def render_feature_recovery(
         "RECOVERY_LOADER_HASH": recovery_loader_sha256.lower(),
         "ROLLBACK_HASH": rollback_sha256.lower(),
         "RESTORE_HASH": restore_sha256.lower(),
+        "START_IN_WINDOWS": "1" if start_in_windows else "",
+        "ORIGINAL_BCD_HASH": original_bcd_sha256.lower(),
         "RECEIPT": feature_recovery_receipt(job, image, hooks).decode("ascii").strip(),
         "CAPTURED_HOOKS": _captured_hooks(post),
         "HOOK_HELPERS": _hook_helpers(

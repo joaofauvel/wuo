@@ -1,5 +1,5 @@
 :open_hook_hive
-"%SYS%\reg.exe" load "%HOOK_HIVE%" "@@SYSTEM_HIVE@@" >>"%LOG%" 2>&1 || exit /b 1
+@@MOUNT@@
 @@BACKUP_LINE@@set "HOOK_KEY=%HOOK_HIVE%\Select"
 set "HOOK_NAME=Default"
 call :read_hook || goto hook_failed
@@ -35,5 +35,5 @@ exit /b 0
 
 :hook_failed
 >>"%LOG%" echo Hook phase %PHASE% failed. Inspect the value log.
-"%SYS%\reg.exe" unload "%HOOK_HIVE%" >>"%LOG%" 2>&1
+@@UNMOUNT@@
 exit /b 1

@@ -4,6 +4,7 @@ param(
     [Parameter(ParameterSetName = 'Prepare')][Guid]$RetryPrepareJob,
     [Parameter(Mandatory, ParameterSetName = 'Finalize')][Guid]$FinalizeJob,
     [Parameter(Mandatory, ParameterSetName = 'CheckRetry')][Guid]$CheckRetryJob,
+    [Parameter(Mandatory, ParameterSetName = 'CheckDiscard')][Guid]$CheckDiscardJob,
     [Parameter(ParameterSetName = 'CheckRetry')][switch]$StagedRetry,
     [Parameter(Mandatory, ParameterSetName = 'Complete')][Guid]$CompleteJob,
     [Parameter(Mandatory, ParameterSetName = 'Complete')][ValidateSet('success', 'failure')][string]$Outcome
@@ -138,10 +139,12 @@ function Assert-ProtectedRecoveryMedia([string]$Job, [string]$JobId, $Request) {
         throw 'The protected recovery request is invalid.'
     }
     Assert-JobMarker (Join-Path $Job 'feature.protected') $JobId
-    $proof = Join-Path $Job 'independent-preflight.done'
-    Assert-PlainPath $proof
-    if ([IO.File]::ReadAllText($proof, [Text.Encoding]::ASCII) -cne "$($recovery.receipt)`r`n") {
-        throw 'The independent recovery preflight did not pass for this job.'
+    if ($Request.start_in_windows -ne $true) {
+        $proof = Join-Path $Job 'independent-preflight.done'
+        Assert-PlainPath $proof
+        if ([IO.File]::ReadAllText($proof, [Text.Encoding]::ASCII) -cne "$($recovery.receipt)`r`n") {
+            throw 'The independent recovery preflight did not pass for this job.'
+        }
     }
     $partitions = @(Get-Partition)
     foreach ($item in @(@($entry.media, $entry.media_volume), @($entry.efi, $entry.efi_volume))) {
@@ -180,6 +183,21 @@ function Assert-NativeSafeOsQueue {
         $loader -notmatch '(?im)^path[ \t]+\\Windows\\System32\\winload\.efi[ \t]*$') {
         throw 'The Windows boot queue does not match the native SafeOS image.'
     }
+}
+
+function Clear-AbortedProtectedBoot($Recovery) {
+    $next = Get-WuoRecoveryBootNext
+    if (!$next) { return }
+    if ($next -cne $Recovery.id) { throw 'The one-time firmware boot no longer belongs to this Wuo job.' }
+    Assert-WuoUnchangedBootEntry $Recovery
+    $bcd = "$env:SystemRoot\System32\bcdedit.exe"
+    $manager = (& $bcd /enum '{fwbootmgr}' /v) -join "`n"
+    $sequence = [regex]::Matches($manager, '(?im)^bootsequence\s+(\{[0-9a-f-]+\})[ \t]*$')
+    if ($LASTEXITCODE -ne 0 -or $sequence.Count -ne 1 -or $sequence[0].Groups[1].Value -ine $Recovery.bcd_id) {
+        throw 'The firmware manager did not confirm the captured recovery selection.'
+    }
+    & $bcd /deletevalue '{fwbootmgr}' bootsequence | Out-Null
+    if ($LASTEXITCODE -ne 0 -or (Get-WuoRecoveryBootNext)) { throw 'Could not clear the one-time recovery selection.' }
 }
 
 function Assert-FeatureRetry {
@@ -328,20 +346,33 @@ function Get-MatchingImage {
 $finalizing = $PSCmdlet.ParameterSetName -eq 'Finalize'
 $completing = $PSCmdlet.ParameterSetName -eq 'Complete'
 $checkingRetry = $PSCmdlet.ParameterSetName -eq 'CheckRetry'
+$checkingDiscard = $PSCmdlet.ParameterSetName -eq 'CheckDiscard'
 $retryPreparing = $Prepare -and $PSBoundParameters.ContainsKey('RetryPrepareJob')
 $protected = $false
+$reportWindowsStart = $false
+$bootArmed = $false
+trap {
+    if ($reportWindowsStart) {
+        [IO.File]::WriteAllText((Join-Path $job 'windows-start-error.log'), $_.Exception.Message, [Text.UTF8Encoding]::new($false))
+        if ((Test-Path -LiteralPath $authorized) -and !(Test-Path -LiteralPath $claimed)) {
+            Assert-JobMarker $authorized $jobId
+            [IO.File]::Move($authorized, (Join-Path $job 'windows-start-aborted.id'))
+        }
+    }
+    break
+}
 $stagedSystem = Join-Path "$env:SystemDrive\" '$WINDOWS.~BT\NewOS\Windows\System32\Config\SYSTEM'
-if ($finalizing -or $completing -or $checkingRetry -or $retryPreparing) {
+if ($finalizing -or $completing -or $checkingRetry -or $retryPreparing -or $checkingDiscard) {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    if ($checkingRetry -or $retryPreparing) {
+    if ($checkingRetry -or $retryPreparing -or $checkingDiscard) {
         $principal = [Security.Principal.WindowsPrincipal]::new($identity)
         if (!$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-            throw 'Check the feature upgrade retry from an elevated Windows terminal.'
+            throw 'Check the failed feature upgrade from an elevated Windows terminal.'
         }
     } elseif ($identity.User.Value -ne 'S-1-5-18') {
         throw 'A feature upgrade can only resume from the LocalSystem startup task.'
     }
-    $jobId = if ($checkingRetry) { $CheckRetryJob.ToString('D') } elseif ($retryPreparing) {
+    $jobId = if ($checkingDiscard) { $CheckDiscardJob.ToString('D') } elseif ($checkingRetry) { $CheckRetryJob.ToString('D') } elseif ($retryPreparing) {
         $RetryPrepareJob.ToString('D')
     } elseif ($finalizing) {
         $FinalizeJob.ToString('D')
@@ -354,9 +385,11 @@ if ($finalizing -or $completing -or $checkingRetry -or $retryPreparing) {
     $claimed = Join-Path $job 'claimed.id'
     $rollbackMarker = Join-Path $job 'boot-rollback.id'
     $bootPhase = Join-Path $job 'boot-completion.phase'
+    $preflightFailure = Join-Path $job 'protected-preflight.failed'
     $rolledBack = $finalizing -and (Test-Path -LiteralPath $rollbackMarker)
     $retryBoot = $finalizing -and (Test-Path -LiteralPath $bootPhase)
-    if ($finalizing -and !$rolledBack -and !$retryBoot -and !(Test-Path -LiteralPath $authorized)) { return }
+    $preflightFailed = $finalizing -and (Test-Path -LiteralPath $preflightFailure)
+    if ($finalizing -and !$rolledBack -and !$retryBoot -and !$preflightFailed -and !(Test-Path -LiteralPath $authorized)) { return }
     Assert-PlainPath $programData -Directory
     foreach ($path in $root, $jobs, $job) {
         Assert-ProtectedJobDirectory $path
@@ -365,7 +398,9 @@ if ($finalizing -or $completing -or $checkingRetry -or $retryPreparing) {
         Assert-JobMarker $rollbackMarker $jobId
     } else {
         Assert-JobMarker (Join-Path $job 'feature.ready') $jobId
-        if ($completing -or $checkingRetry -or $retryPreparing -or $retryBoot) { Assert-JobMarker $claimed $jobId }
+        if ($completing -or $checkingRetry -or $retryPreparing -or $retryBoot -or $preflightFailed -or $checkingDiscard) {
+            Assert-JobMarker $claimed $jobId
+        }
         else {
             Assert-JobMarker $authorized $jobId
             if (Test-Path -LiteralPath $claimed) { throw 'This feature upgrade has already been claimed.' }
@@ -383,6 +418,40 @@ if ($finalizing -or $completing -or $checkingRetry -or $retryPreparing) {
         throw 'Invalid feature upgrade request.'
     }
     $protected = $request.schema -eq 2
+    if ($checkingDiscard) {
+        if (!$protected -or $request.start_in_windows -ne $true) { throw 'This job does not use protected Windows launch.' }
+        $env:WUO_FEATURE_SOURCE = $request.source
+        Assert-SourceMachine
+        Assert-WindowsReady
+        if ((Test-Path -LiteralPath $authorized) -or (Test-Path -LiteralPath $rollbackMarker) -or
+            (Test-Path -LiteralPath (Join-Path $job 'safeos.ready')) -or
+            (Test-Path -LiteralPath $stagedSystem) -or
+            (Test-Path -LiteralPath (Join-Path "$env:SystemDrive\" '$WINDOWS.~BT\Sources\SafeOS\winre.wim')) -or
+            (Get-Process -Name setup,setuphost,setupprep,setupplatform,windowsupdatebox -ErrorAction SilentlyContinue)) {
+            throw 'Windows Setup may still be active. Keep the backup and review wuo status.'
+        }
+        $result = Join-Path $job 'boot-order-result.json'
+        foreach ($path in $bootPhase, $result) { Assert-PlainPath $path }
+        $report = [IO.File]::ReadAllText($result) | ConvertFrom-Json
+        if ([IO.File]::ReadAllText($bootPhase).Trim() -ne 'failure' -or $report.order -notin 'restored','unchanged' -or
+            $report.fallback -notin 'restored','unchanged','absent') {
+            throw 'The original firmware state must be restored before clearing this job.'
+        }
+        Assert-BootPreservationAssets $job $request
+        . (Join-Path $job 'feature_boot.ps1')
+        Assert-WuoRecoveryBootNextIdle
+        $windowsManager = & "$env:SystemRoot\System32\bcdedit.exe" /enum '{bootmgr}' /v
+        if ($LASTEXITCODE -ne 0 -or ($windowsManager -match '^\s*bootsequence\s+')) {
+            throw 'Windows Boot Manager still has a queued boot selection.'
+        }
+        return
+    }
+    if ($preflightFailed) {
+        if (!$protected -or $request.start_in_windows -ne $true) { throw 'Unexpected independent recovery failure marker.' }
+        Assert-JobMarker $preflightFailure $jobId
+        Assert-JobMarker (Join-Path $job 'precommit.done') $jobId
+        if (Test-Path -LiteralPath (Join-Path $job 'safeos.ready')) { throw 'SafeOS already ran for this upgrade.' }
+    }
     if ($protected -and ($checkingRetry -or $retryPreparing)) {
         throw 'Use the independent recovery media to recover this protected feature job.'
     }
@@ -397,9 +466,9 @@ if ($finalizing -or $completing -or $checkingRetry -or $retryPreparing) {
         if (Test-Path -LiteralPath $preparedMarker) { throw 'The feature retry is already prepared.' }
         Assert-FeatureRetry $job $jobId $request $stagedSystem
     }
-    if ($completing -or $rolledBack -or $retryBoot) {
+    if ($completing -or $rolledBack -or $retryBoot -or $preflightFailed) {
         if ($rolledBack -and $request.rollback -ne $true) { throw 'The rollback request is missing.' }
-        $completion = if ($rolledBack) { 'rollback' } elseif ($completing) { $Outcome } else {
+        $completion = if ($rolledBack) { 'rollback' } elseif ($completing) { $Outcome } elseif ($preflightFailed) { 'failure' } else {
             Assert-PlainPath $bootPhase
             $phaseText = [IO.File]::ReadAllText($bootPhase, [Text.Encoding]::ASCII)
             if ($phaseText -cnotin "success`r`n", "failure`r`n") { throw 'Invalid boot preservation completion phase.' }
@@ -407,6 +476,10 @@ if ($finalizing -or $completing -or $checkingRetry -or $retryPreparing) {
         }
         Complete-FeatureBoot $job $jobId $request $completion
         return
+    }
+    $reportWindowsStart = $finalizing -and $protected -and $request.start_in_windows -eq $true
+    if ($reportWindowsStart) {
+        [IO.File]::WriteAllText((Join-Path $job 'windows-started.id'), "$jobId`r`n", [Text.Encoding]::ASCII)
     }
     Assert-BootPreservationAssets $job $request
     $env:WUO_FEATURE_ISO = $request.iso
@@ -512,10 +585,26 @@ try {
             }
             Assert-ProtectedRecoveryMedia $job $jobId $request
             . $safeosHelper
+            if ($reportWindowsStart) {
+                $sourceHooks = Join-Path $job 'source-hooks.cmd'
+                $sourceDigest = Join-Path $job 'source-hooks.sha256'
+                if ($request.source_hooks_sha256 -or (Test-Path -LiteralPath $sourceHooks) -or (Test-Path -LiteralPath $sourceDigest)) {
+                    Assert-PlainPath $sourceHooks
+                    Assert-PlainPath $sourceDigest
+                    $digest = [IO.File]::ReadAllText($sourceDigest, [Text.Encoding]::ASCII).Trim()
+                    if ($digest -cnotmatch '^[0-9a-f]{64}$' -or $digest -cne $request.source_hooks_sha256 -or
+                        (Get-WuoFileHash $sourceHooks) -cne $digest) {
+                        throw 'The captured source hooks changed.'
+                    }
+                    & $sourceHooks
+                    if ($LASTEXITCODE -ne 0) { throw 'The source hooks failed. See pre-feature.log.' }
+                }
+            }
         }
         [IO.File]::Move($authorized, $claimed)
         if ($protected) {
             Set-WuoProtectedSetupBoot $request.recovery.entry Arm
+            $bootArmed = $true
             Set-WuoProtectedRecoveryOrder $request.recovery.entry
             Add-Content -LiteralPath (Join-Path $job 'protected-stage.log') -Encoding Ascii -Value 'Verified independent recovery first before running Windows Setup.'
         }
@@ -535,14 +624,29 @@ try {
             Assert-ProtectedRecoveryMedia $job $jobId $request
             Assert-NativeSafeOsQueue
             $wim = Join-Path "$env:SystemDrive\" '$WINDOWS.~BT\Sources\SafeOS\winre.wim'
-            $patchedHash = Install-WuoSafeOsImage $wim $job $safeosWrapper
+            $patchedHash = Install-WuoSafeOsImage $wim $job $safeosWrapper -FileCompare:$reportWindowsStart
             [IO.File]::WriteAllText((Join-Path $job 'safeos.sha256'), "$patchedHash`r`n", [Text.Encoding]::ASCII)
             Assert-ProtectedRecoveryMedia $job $jobId $request
             Assert-NativeSafeOsQueue
-            Start-WuoSafeOsBoot $request.recovery.entry $request.recovery.entry.windows_entry
-            Add-Content -LiteralPath (Join-Path $job 'protected-stage.log') -Encoding Ascii -Value 'Verified the staged SafeOS image and one-time Windows Boot Manager selection.'
+            if ($reportWindowsStart) {
+                Assert-WuoUnchangedBootEntry $request.recovery.entry
+                Assert-WuoUnchangedBootEntry $request.recovery.entry.windows_entry
+                Assert-WuoRecoveryFirst $request.recovery.entry
+                if ((Get-WuoRecoveryBootNext) -cne $request.recovery.entry.id) {
+                    throw 'The one-time firmware selection is not independent recovery.'
+                }
+                Add-Content -LiteralPath (Join-Path $job 'protected-stage.log') -Encoding Ascii -Value 'Setup is ready. Starting the automatic independent recovery check.'
+                [IO.File]::WriteAllText((Join-Path $job 'protected-reboot.ready'), "$jobId`r`n", [Text.Encoding]::ASCII)
+                Start-Sleep -Seconds 5
+            } else {
+                Start-WuoSafeOsBoot $request.recovery.entry $request.recovery.entry.windows_entry
+                Add-Content -LiteralPath (Join-Path $job 'protected-stage.log') -Encoding Ascii -Value 'Verified the staged SafeOS image and one-time Windows Boot Manager selection.'
+            }
             & "$env:SystemRoot\System32\shutdown.exe" /r /t 0
             if ($LASTEXITCODE -ne 0) { throw 'Could not start the verified SafeOS reboot.' }
+            if ($reportWindowsStart) {
+                [IO.File]::WriteAllText((Join-Path $job 'protected-reboot.id'), "$jobId`r`n", [Text.Encoding]::ASCII)
+            }
         }
     }
     if ($Prepare) {
@@ -578,10 +682,25 @@ try {
         revision = $image.SPBuild
     } | ConvertTo-Json -Compress
 } catch {
+    $failure = $_
     if ($protected -and $finalizing) {
-        Add-Content -LiteralPath (Join-Path $job 'protected-stage.log') -Encoding Utf8 -Value $_.Exception.Message
+        $stageLog = Join-Path $job 'protected-stage.log'
+        Add-Content -LiteralPath $stageLog -Encoding Utf8 -Value $failure.Exception.Message
+        if ($reportWindowsStart -and $bootArmed -and !(Test-Path -LiteralPath $stagedSystem) -and
+            !(Test-Path -LiteralPath (Join-Path "$env:SystemDrive\" '$WINDOWS.~BT\Sources\SafeOS\winre.wim'))) {
+            try {
+                $windowsManager = & "$env:SystemRoot\System32\bcdedit.exe" /enum '{bootmgr}' /v
+                if ($LASTEXITCODE -ne 0 -or ($windowsManager -match '^\s*bootsequence\s+')) {
+                    throw 'Could not rule out a queued Windows Setup restart.'
+                }
+                Clear-AbortedProtectedBoot $request.recovery.entry
+                Complete-FeatureBoot $job $jobId $request 'failure'
+            } catch {
+                Add-Content -LiteralPath $stageLog -Encoding Utf8 -Value $_.Exception.Message
+            }
+        }
     }
-    throw
+    throw $failure
 } finally {
     try {
         if ($mountedHere) { Dismount-DiskImage -ImagePath $iso -StorageType ISO | Out-Null }

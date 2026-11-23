@@ -35,8 +35,9 @@ def test_main_help_shows_the_routine_commands(
     assert cli.main(["prepare-drivers", "--help"]) == 0
 
 
+@pytest.mark.parametrize("start_in_windows", [False, True])
 def test_feature_task_keeps_the_full_id_and_escapes_the_script_path(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, start_in_windows: bool
 ) -> None:
     from wuo import winre_menu
 
@@ -62,6 +63,9 @@ def test_feature_task_keeps_the_full_id_and_escapes_the_script_path(
         definition = ElementTree.parse(task_file).getroot()
         assert definition.find("{*}Triggers/{*}BootTrigger") is not None
         assert definition.findtext("{*}Principals/{*}Principal/{*}UserId") == "S-1-5-18"
+        assert definition.findtext("{*}Settings/{*}StopIfGoingOnBatteries") == (
+            "false" if start_in_windows else None
+        )
         assert definition.findtext("{*}Actions/{*}Exec/{*}Command") == str(
             windows / "System32/WindowsPowerShell/v1.0/powershell.exe"
         )
@@ -71,7 +75,7 @@ def test_feature_task_keeps_the_full_id_and_escapes_the_script_path(
         return ""
 
     monkeypatch.setattr(winre_menu, "_run", register)
-    menu._register_feature_task(JOB, script)
+    menu._register_feature_task(JOB, script, start_in_windows=start_in_windows)
     assert len(task_files) == 1
     assert not task_files[0].exists()
 
@@ -150,6 +154,26 @@ def test_feature_is_published_only_after_backup_and_deferred_setup(
     system32.mkdir(parents=True)
     for name in ("certutil.exe", "findstr.exe", "fc.exe"):
         (system32 / name).write_bytes(name.encode("ascii"))
+    old_state = menu.job_state(JOB)
+    old_state.mkdir()
+    (old_state / "feature.ready").write_bytes(f"{JOB}\r\n".encode("ascii"))
+    (menu.root / f"pending.{JOB}.abandoned.id").write_bytes(
+        f"{JOB}\r\n".encode("ascii")
+    )
+    old_callbacks = system32 / "update" / "runonce" / JOB
+    old_callbacks.mkdir(parents=True)
+    old_precommit = old_callbacks / "precommit.cmd"
+    old_precommit.write_bytes(b"@exit /b 77\r\n")
+    (old_state / "feature.json").write_text(
+        json.dumps(
+            {
+                "id": JOB,
+                "machine": OWNER,
+                "callback_sha256": package_hashes(old_precommit)[0],
+            }
+        ),
+        encoding="ascii",
+    )
 
     def capture(_target: object, mode: str, job: Path) -> dict[str, object]:
         assert mode == "Capture"
@@ -159,6 +183,10 @@ def test_feature_is_published_only_after_backup_and_deferred_setup(
         return {"schema": 1}
 
     def backup(_target: object, job: object, _drive: object) -> tuple[bytes, Path]:
+        assert not old_callbacks.exists()
+        assert (
+            old_state / "archived-setup-callbacks" / "precommit.cmd"
+        ).read_bytes() == b"@exit /b 77\r\n"
         events.append("backup")
         if backup_fails:
             raise ValueError("backup failed")
@@ -188,7 +216,9 @@ def test_feature_is_published_only_after_backup_and_deferred_setup(
     def prepare(*_args: object) -> None:
         assert not protected
         assert not (menu.root / "pending.id").exists()
-        assert not list(menu.job_state(JOB).parent.glob("*/feature.ready"))
+        assert tuple(menu.job_state(JOB).parent.glob("*/feature.ready")) == (
+            old_state / "feature.ready",
+        )
         (portable,) = backup_root.glob("*/recovery")
         job = menu.job_state(portable.parent.name)
         assert (portable / "restore.cmd").read_bytes() == (
@@ -498,6 +528,223 @@ def test_feature_cli_blocks_post_hooks_before_offer_to_stage(
     with pytest.raises(ValueError, match="after SafeOS"):
         asyncio.run(run())
     assert "Preparing Windows Setup" not in capsys.readouterr().out
+
+
+def test_protected_feature_cli_launches_setup_from_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from wuo import feature_upgrade
+    from wuo.update import PreparedUpdates
+    from wuo.winre_menu import Menu
+
+    identity = TargetIdentity(
+        "25H2", 26200, 9974, "x64", tmp_path / "Windows", OWNER, LOADER
+    )
+    job = tmp_path / JOB
+    menu = Menu(identity)
+    menu.root.mkdir(parents=True)
+    args = argparse.Namespace(
+        feature_iso=tmp_path / "Windows.iso",
+        iso_sha256="ab" * 32,
+        backup_drive="D:",
+        recovery_drive="E:",
+        preserve_boot_order=True,
+        dry_run=False,
+        only=["features"],
+        driver_cache=True,
+        extractor=None,
+    )
+    events: list[str] = []
+
+    async def scan(*_: object, prepared: PreparedUpdates, **__: object) -> int:
+        prepared.feature = feature_upgrade.FeatureImage(
+            1, 26300, 9457, "Core", "x64", "en-US"
+        )
+        return 0
+
+    def stage(
+        _menu: Menu, media: feature_upgrade.FeatureMedia, *_: object, **__: object
+    ) -> Path:
+        assert media.start_in_windows
+        events.append("stage")
+        return job
+
+    def start(_menu: Menu, path: Path) -> None:
+        assert path == job
+        events.append("start")
+
+    async def watch(target: TargetIdentity, path: Path) -> None:
+        assert target == identity
+        assert path == job
+        events.append("watch")
+
+    monkeypatch.setattr(cli, "run_update", scan)
+    monkeypatch.setattr(Menu, "check_windows", lambda _: True)
+    monkeypatch.setattr("wuo.target.read_target", lambda: identity)
+    monkeypatch.setattr(Menu, "stage_feature", stage)
+    monkeypatch.setattr(Menu, "start_protected_feature", start, raising=False)
+    monkeypatch.setattr(feature_upgrade, "watch_feature_setup", watch, raising=False)
+    monkeypatch.setattr(Menu, "offer_restart", lambda _: pytest.fail("Opened WinRE"))
+
+    async def run() -> int:
+        async with httpx.AsyncClient() as client:
+            return await cli._stage_update(
+                client, args, identity, menu, True, tmp_path, None
+            )
+
+    assert asyncio.run(run()) == 0
+    assert events == ["stage", "start", "watch"]
+    output = capsys.readouterr().out
+    assert "restart automatically" in output
+    assert "Boot Ventoy once" not in output
+
+
+def test_windows_feature_pre_hooks_use_the_live_system_hive() -> None:
+    from wuo.hooks import Hook
+    from wuo.recovery import render_feature_source_hooks
+
+    hook = Hook("pre", "Services\\Example", "Start", 0, None, "control-set")
+    script = render_feature_source_hooks((hook,), rollback=True, live=True)
+
+    assert 'set "HOOK_HIVE=HKLM\\SYSTEM"' in script
+    assert 'reg.exe" save "%HOOK_HIVE%"' in script
+    assert 'reg.exe" load' not in script
+    assert 'reg.exe" unload' not in script
+    assert "ORIGINAL_1" in script
+
+
+def test_protected_feature_progress_ignores_compatibility_scan_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+    from types import SimpleNamespace
+
+    from wuo.feature_upgrade import feature_setup_progress
+
+    identity = TargetIdentity(
+        "25H2", 26200, 9974, "x64", tmp_path / "Windows", OWNER, LOADER
+    )
+    job = tmp_path / JOB
+    job.mkdir()
+    for leaf in ("claimed.id", "windows-started.id", "protected-stage.log"):
+        (job / leaf).touch()
+    log = tmp_path / "$WINDOWS.~BT/Sources/Panther/setupact.log"
+    log.parent.mkdir(parents=True)
+
+    def missing_key(*_: object) -> None:
+        raise FileNotFoundError
+
+    monkeypatch.setitem(
+        sys.modules,
+        "winreg",
+        SimpleNamespace(HKEY_LOCAL_MACHINE=0, OpenKey=missing_key),
+    )
+    log.write_text(
+        "2000-01-01 10:00:00, Info MOUPG Overall progress: [100%]\n",
+        encoding="ascii",
+    )
+    assert (
+        feature_setup_progress(identity, job)
+        == "Windows Setup is preparing the upgrade."
+    )
+    log.write_text(
+        "2099-01-01 10:00:00, Info MOUPG Overall progress: [23%]\n",
+        encoding="ascii",
+    )
+    assert "23% of this phase" in feature_setup_progress(identity, job)
+    (job / "finalize.result").touch()
+    assert "Verifying the recovery handoff" in feature_setup_progress(identity, job)
+
+
+@pytest.mark.parametrize("task_fails", [False, True])
+def test_protected_feature_launch_consumes_only_its_staged_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, task_fails: bool
+) -> None:
+    from wuo import winre_menu
+
+    identity = TargetIdentity(
+        "25H2", 26200, 9974, "x64", tmp_path / "Windows", OWNER, LOADER
+    )
+    menu = winre_menu.Menu(identity)
+    job = menu.job_state(JOB)
+    job.mkdir(parents=True)
+    menu.root.mkdir(parents=True)
+    (menu.root / "installed.id").write_text(OWNER + "\n", encoding="ascii")
+    (menu.root / "pending.id").write_text(JOB + "\n", encoding="ascii")
+    for leaf in ("feature.ready", "feature.protected"):
+        (job / leaf).write_text(JOB + "\n", encoding="ascii")
+    (job / "feature.json").write_text(
+        json.dumps(
+            {"id": JOB, "machine": OWNER, "schema": 2, "start_in_windows": True}
+        ),
+        encoding="ascii",
+    )
+
+    def launch(command: list[Path | str]) -> str:
+        assert command[1:] == ["/Run", "/TN", f"wuo-feature-{JOB}"]
+        assert (job / "authorized.id").read_bytes() == f"{JOB}\r\n".encode("ascii")
+        if task_fails:
+            raise ValueError("scheduler refused")
+        return ""
+
+    monkeypatch.setattr(winre_menu, "_run", launch)
+    if task_fails:
+        with pytest.raises(ValueError, match="scheduler refused"):
+            menu.start_protected_feature(job)
+        assert not (job / "authorized.id").exists()
+    else:
+        menu.start_protected_feature(job)
+        assert (job / "authorized.id").exists()
+        with pytest.raises(FileExistsError):
+            menu.start_protected_feature(job)
+
+
+def test_discard_checks_failed_protected_setup_before_archiving(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wuo import feature_upgrade, feature_ventoy, winre_menu
+
+    identity = TargetIdentity(
+        "25H2", 26200, 9974, "x64", tmp_path / "Windows", OWNER, LOADER
+    )
+    menu = winre_menu.Menu(identity)
+    job = menu.job_state(JOB)
+    job.mkdir(parents=True)
+    menu.root.mkdir(parents=True)
+    (menu.root / "installed.id").write_text(OWNER + "\n", encoding="ascii")
+    (menu.root / "pending.id").write_text(JOB + "\n", encoding="ascii")
+    for leaf in ("feature.ready", "feature.protected", "claimed.id"):
+        (job / leaf).write_text(JOB + "\n", encoding="ascii")
+    (job / "feature.json").write_text(
+        json.dumps(
+            {
+                "id": JOB,
+                "machine": OWNER,
+                "schema": 2,
+                "start_in_windows": True,
+                "recovery": {"entry": {"media_volume": "E:\\"}},
+            }
+        ),
+        encoding="ascii",
+    )
+    events: list[str] = []
+    monkeypatch.setattr(
+        feature_upgrade,
+        "check_failed_protected_feature",
+        lambda *_: events.append("validate"),
+        raising=False,
+    )
+    monkeypatch.setattr(winre_menu, "_run", lambda _: events.append("disable") or "")
+    monkeypatch.setattr(
+        feature_ventoy, "restore_recovery_media", lambda *_: events.append("restore")
+    )
+
+    menu.discard()
+
+    assert events == ["validate", "disable", "restore"]
+    assert not (menu.root / "pending.id").exists()
+    assert (job / "claimed.id").is_file()
 
 
 def test_feature_verification_waits_for_boot_preservation_receipt(

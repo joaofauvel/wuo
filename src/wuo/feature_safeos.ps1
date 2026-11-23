@@ -4,7 +4,7 @@ function Test-WuoSafeOsWimProjection([string]$Path) {
     return ($LASTEXITCODE -eq 0 -and $details.Count -gt 0 -and $details[0] -match ':\s*0x80000008\s*$')
 }
 
-function Install-WuoSafeOsWrapper([string]$Mount, [string]$Wrapper) {
+function Install-WuoSafeOsWrapper([string]$Mount, [string]$Wrapper, [switch]$FileCompare) {
     $system = Join-Path $Mount 'Windows\System32'
     $launcher = Join-Path $system 'winpeshl.ini'
     $native = Join-Path $Mount 'sources\recovery\recenv.exe'
@@ -35,6 +35,23 @@ function Install-WuoSafeOsWrapper([string]$Mount, [string]$Wrapper) {
     if (Get-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue) {
         throw "$errorPrefix because the wrapper destination is already occupied."
     }
+    if ($FileCompare) {
+        $compare = Join-Path $system 'fc.exe'
+        $item = Get-Item -LiteralPath $compare -Force -ErrorAction SilentlyContinue
+        if (!$item) {
+            $source = Join-Path $env:SystemRoot 'System32\fc.exe'
+            if ((Get-WuoPathKind $source) -ne 'file') {
+                throw "$errorPrefix because the trusted file comparison tool is unavailable."
+            }
+            [IO.File]::Copy($source, $compare, $false)
+            if ((Get-WuoFileHash $compare) -cne (Get-WuoFileHash $source)) {
+                throw "$errorPrefix because the recovery comparison tool failed readback."
+            }
+        } elseif ($item.PSIsContainer -or
+                  ($item.Attributes.HasFlag([IO.FileAttributes]::ReparsePoint) -and !(Test-WuoSafeOsWimProjection $compare))) {
+            throw "$errorPrefix because the file comparison path is invalid."
+        }
+    }
     [IO.File]::Copy($Wrapper, $destination, $false)
     [IO.File]::WriteAllLines($launcher, @(
         '[LaunchApps]',
@@ -49,7 +66,7 @@ function Invoke-WuoSafeOsDism([string[]]$Options, [string]$LogPath) {
     }
 }
 
-function Install-WuoSafeOsImage([string]$NativeWim, [string]$Job, [string]$Wrapper) {
+function Install-WuoSafeOsImage([string]$NativeWim, [string]$Job, [string]$Wrapper, [switch]$FileCompare) {
     # The caller holds the protected job and has verified the native Setup boot entry.
     $staged = Join-Path $Job 'safeos-staged.wim'
     $original = Join-Path $Job 'safeos-original.wim'
@@ -68,7 +85,7 @@ function Install-WuoSafeOsImage([string]$NativeWim, [string]$Job, [string]$Wrapp
     $null = [IO.Directory]::CreateDirectory($mount)
     try {
         Invoke-WuoSafeOsDism @('/Mount-Image', "/ImageFile:$staged", '/Index:1', "/MountDir:$mount", '/CheckIntegrity') $log
-        Install-WuoSafeOsWrapper $mount $Wrapper
+        Install-WuoSafeOsWrapper $mount $Wrapper -FileCompare:$FileCompare
         Invoke-WuoSafeOsDism @('/Unmount-Image', "/MountDir:$mount", '/Commit', '/CheckIntegrity') $log
     } catch {
         $failure = $_

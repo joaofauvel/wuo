@@ -109,13 +109,15 @@ async def _stage_update(
     profile: Path | None,
 ) -> int:
     iso = getattr(args, "feature_iso", None)
+    recovery_drive = getattr(args, "recovery_drive", None)
     feature_media = (
         FeatureMedia(
             iso,
             args.iso_sha256,
             rollback=bool(args.backup_drive),
             preserve_boot_order=getattr(args, "preserve_boot_order", False),
-            recovery_drive=getattr(args, "recovery_drive", None),
+            recovery_drive=recovery_drive,
+            start_in_windows=bool(recovery_drive),
         )
         if iso is not None
         else None
@@ -213,7 +215,11 @@ async def _stage_update(
                     "Preparing Windows Setup. Use Troubleshoot > wuo to continue after preparation."
                 )
             else:
-                print("Preparing the rollback backup and independent Ventoy recovery.")
+                print(
+                    "Preparing the rollback backup and Ventoy recovery. "
+                    "Save your work. Windows will restart automatically after Setup is ready.",
+                    flush=True,
+                )
             job = await asyncio.to_thread(
                 menu.stage_feature,
                 feature_media,
@@ -225,10 +231,10 @@ async def _stage_update(
             if feature_media.recovery_drive is None:
                 await asyncio.to_thread(menu.offer_restart)
             else:
-                print(
-                    f"Boot Ventoy once and let it select WUO-Recovery-{job.name}.iso automatically. "
-                    "Return to Windows and run wuo update after it succeeds."
-                )
+                from .feature_upgrade import watch_feature_setup
+
+                await asyncio.to_thread(menu.start_protected_feature, job)
+                await watch_feature_setup(current, job)
             return 0
         category = "monthly" if prepared.monthly else "drivers"
         if prepared.feature is not None:
