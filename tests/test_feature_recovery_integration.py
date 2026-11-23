@@ -232,7 +232,7 @@ $ast = [Management.Automation.Language.Parser]::ParseFile($env:WUO_SOURCE, [ref]
 $validation = $ast.Find({
     param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
-        $node.Name -eq 'Assert-NativeSafeOsQueue'
+        $node.Name -eq 'Get-NativeSafeOsQueue'
 }, $false)
 . ([scriptblock]::Create($validation.Extent.Text))
 function Mock-WuoBCD {
@@ -254,7 +254,7 @@ function Mock-WuoBCD {
 }
 $env:SystemDrive = 'C:'
 Set-Alias "$env:SystemRoot\System32\bcdedit.exe" Mock-WuoBCD
-Assert-NativeSafeOsQueue
+$null = Get-NativeSafeOsQueue
 'verified'
 """
     result = subprocess.run(
@@ -271,3 +271,80 @@ Assert-NativeSafeOsQueue
     else:
         assert result.returncode != 0
         assert "SafeOS" in result.stderr
+
+
+@pytest.mark.skipif(POWERSHELL is None, reason="requires Windows PowerShell")
+@pytest.mark.parametrize(
+    "case", ["safeos", "idle", "foreign-loader", "different-default", "export-fails"]
+)
+def test_aborted_protected_setup_disarms_only_its_native_queue(
+    tmp_path: Path, case: str
+) -> None:
+    assert POWERSHELL is not None
+    script = r"""
+$ErrorActionPreference = 'Stop'
+$ast = [Management.Automation.Language.Parser]::ParseFile($env:WUO_SOURCE, [ref]$null, [ref]$null)
+foreach ($definition in $ast.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -in 'Get-NativeSafeOsQueue', 'Clear-AbortedNativeSetupBoot'
+}, $false)) {
+    . ([scriptblock]::Create($definition.Extent.Text))
+}
+$env:SystemDrive = 'C:'
+$script:queued = $env:WUO_CASE -ne 'idle'
+function Mock-WuoBCD {
+    $global:LASTEXITCODE = 0
+    $current = '{11111111-1111-1111-1111-111111111111}'
+    $loader = '{22222222-2222-2222-2222-222222222222}'
+    if ($args[0] -eq '/export') {
+        if ($env:WUO_CASE -eq 'export-fails') { $global:LASTEXITCODE = 1; return }
+        [IO.File]::WriteAllText($args[1], 'preserved BCD')
+        return
+    }
+    if ($args[0] -eq '/deletevalue') {
+        if ($args[1] -ne '{bootmgr}' -or $args[2] -ne 'bootsequence') { throw 'Unexpected BCD write' }
+        if (!(Test-Path -LiteralPath (Join-Path $env:WUO_JOB 'bcd-before-abort.bak'))) { throw 'BCD was not backed up' }
+        [IO.File]::WriteAllText((Join-Path $env:WUO_JOB 'deleted.txt'), 'bootsequence')
+        $script:queued = $false
+        return
+    }
+    if ($args[0] -ne '/enum') { throw 'Unexpected BCDEdit command' }
+    if ($args[1] -eq '{bootmgr}') {
+        $default = if ($env:WUO_CASE -eq 'different-default') { $loader } else { $current }
+        "default                 $default"
+        if ($script:queued) { "bootsequence            $loader" }
+        return
+    }
+    if ($args[1] -eq '{current}') {
+        "identifier              $current"
+        'device                  partition=C:'
+        'osdevice                partition=C:'
+        'path                    \WINDOWS\system32\winload.efi'
+        return
+    }
+    if ($args[1] -ne $loader) { throw 'Queried the wrong Setup loader.' }
+    $volume = if ($env:WUO_CASE -eq 'foreign-loader') { 'E:' } else { 'C:' }
+    $image = 'ramdisk=[{0}]\$WINDOWS.~BT\Sources\SafeOS\winre.wim,{{33333333-3333-3333-3333-333333333333}}' -f $volume
+    "device                  $image"
+    "osdevice                $image"
+    'path                    \windows\system32\winload.efi'
+    'winpe                   Yes'
+}
+Set-Alias "$env:SystemRoot\System32\bcdedit.exe" Mock-WuoBCD
+Clear-AbortedNativeSetupBoot $env:WUO_JOB
+"""
+    result = subprocess.run(
+        [POWERSHELL, "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+        env=os.environ
+        | {"WUO_SOURCE": str(NATIVE), "WUO_CASE": case, "WUO_JOB": str(tmp_path)},
+    )
+    if case in {"safeos", "idle"}:
+        assert result.returncode == 0, result.stderr
+    else:
+        assert result.returncode != 0
+    assert (tmp_path / "deleted.txt").is_file() == (case == "safeos")

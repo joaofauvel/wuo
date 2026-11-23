@@ -1050,12 +1050,27 @@ class Menu:
                 raise ValueError(
                     f"The abandoned feature request differs from its marker: {old_state}"
                 )
-            _check_callback(path / "precommit.cmd", request["callback_sha256"])
+            attributes = getattr(path.lstat(), "st_file_attributes", 0)
+            if (
+                path.is_symlink()
+                or attributes & FILE_ATTRIBUTE_REPARSE_POINT
+                or not path.is_dir()
+            ):
+                raise ValueError(f"Unexpected abandoned Setup callback path: {path}")
+            entries = list(path.iterdir())
+            if not entries:
+                continue
+            precommit = path / "precommit.cmd"
+            if precommit not in entries:
+                raise ValueError(
+                    f"The abandoned Setup job is missing its precommit callback: {path}"
+                )
+            _check_callback(precommit, request["callback_sha256"])
             if any(
                 entry.name not in ("precommit.cmd", "success.cmd", "failure.cmd")
                 or not entry.is_file()
                 or entry.is_symlink()
-                for entry in path.iterdir()
+                for entry in entries
             ):
                 raise ValueError(
                     f"Unrecognized files in the abandoned Setup callbacks: {path}"

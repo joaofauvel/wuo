@@ -481,6 +481,44 @@ def test_resume_requires_boot_preservation_in_the_captured_feature_job(
         menu.resume()
 
 
+@pytest.mark.parametrize("orphaned_callback", [False, True])
+def test_abandoned_feature_callbacks_after_manual_archive(
+    tmp_path: Path, orphaned_callback: bool
+) -> None:
+    from wuo.winre_menu import Menu
+
+    windows = tmp_path / "Windows"
+    menu = Menu(TargetIdentity("25H2", 26200, 9974, "x64", windows, OWNER, LOADER))
+    menu.root.mkdir(parents=True)
+    job = menu.job_state(JOB)
+    job.mkdir(parents=True)
+    (menu.root / f"pending.{JOB}.abandoned.id").write_text(JOB + "\n", encoding="ascii")
+    (job / "feature.ready").write_text(JOB + "\n", encoding="ascii")
+    archived = job / "archived-precommit.cmd"
+    archived.write_bytes(b"@exit /b 77\r\n")
+    (job / "feature.json").write_text(
+        json.dumps(
+            {
+                "id": JOB,
+                "machine": OWNER,
+                "callback_sha256": package_hashes(archived)[0],
+            }
+        ),
+        encoding="ascii",
+    )
+    callbacks = windows / "System32/update/runonce"
+    (callbacks / JOB).mkdir(parents=True)
+
+    if orphaned_callback:
+        (callbacks / JOB / "failure.cmd").write_bytes(b"@exit /b 77\r\n")
+        with pytest.raises(ValueError, match="missing its precommit callback"):
+            menu._abandoned_feature_callbacks(callbacks, str(uuid4()))
+    else:
+        assert menu._abandoned_feature_callbacks(callbacks, str(uuid4())) == []
+
+    assert archived.read_bytes() == b"@exit /b 77\r\n"
+
+
 def test_feature_cli_blocks_post_hooks_before_offer_to_stage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

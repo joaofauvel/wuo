@@ -165,11 +165,13 @@ function Assert-ProtectedRecoveryMedia([string]$Job, [string]$JobId, $Request) {
     }
 }
 
-function Assert-NativeSafeOsQueue {
+function Get-NativeSafeOsQueue([switch]$AllowMissing) {
     $bcd = "$env:SystemRoot\System32\bcdedit.exe"
     $manager = (& $bcd /enum '{bootmgr}' /v) -join "`n"
+    if ($LASTEXITCODE -ne 0) { throw 'Could not read the Windows Boot Manager queue.' }
+    if ($AllowMissing -and $manager -notmatch '(?im)^bootsequence(?:[ \t]|$)') { return }
     $selector = [regex]::Matches($manager, '(?im)^bootsequence\s+(\{[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\})[ \t]*$')
-    if ($LASTEXITCODE -ne 0 -or $selector.Count -ne 1 -or
+    if ($selector.Count -ne 1 -or
         $manager -match '(?im)^bootsequence[^\n]+\n[ \t]+\{[0-9a-f-]{36}\}') {
         throw 'Windows Setup did not queue one verified native SafeOS loader.'
     }
@@ -182,6 +184,37 @@ function Assert-NativeSafeOsQueue {
         $loader -notmatch '(?im)^winpe[ \t]+Yes[ \t]*$' -or
         $loader -notmatch '(?im)^path[ \t]+\\Windows\\System32\\winload\.efi[ \t]*$') {
         throw 'The Windows boot queue does not match the native SafeOS image.'
+    }
+    return $queued
+}
+
+function Clear-AbortedNativeSetupBoot([string]$Job) {
+    $queued = Get-NativeSafeOsQueue -AllowMissing
+    if (!$queued) { return }
+    $bcd = "$env:SystemRoot\System32\bcdedit.exe"
+    $manager = (& $bcd /enum '{bootmgr}' /v) -join "`n"
+    $default = [regex]::Match($manager, '(?im)^default[ \t]+(\{[0-9a-f-]+\})[ \t]*$')
+    if ($LASTEXITCODE -ne 0 -or !$default.Success) { throw 'Could not verify the default Windows boot loader.' }
+    $current = (& $bcd /enum '{current}' /v) -join "`n"
+    $defaultId = [regex]::Escape($default.Groups[1].Value)
+    $partition = 'partition=' + [regex]::Escape($env:SystemDrive)
+    if ($LASTEXITCODE -ne 0 -or $current -notmatch "(?im)^identifier[ \t]+$defaultId[ \t]*$" -or
+        $current -notmatch "(?im)^device[ \t]+$partition[ \t]*$" -or
+        $current -notmatch "(?im)^osdevice[ \t]+$partition[ \t]*$" -or
+        $current -notmatch '(?im)^path[ \t]+\\Windows\\system32\\winload\.efi[ \t]*$' -or
+        $current -match '(?im)^winpe[ \t]+Yes[ \t]*$') {
+        throw 'The default Windows boot loader does not match the original running installation.'
+    }
+    $backup = Join-Path $Job 'bcd-before-abort.bak'
+    if (Test-Path -LiteralPath $backup) { throw 'The abort BCD backup path is already in use.' }
+    & $bcd /export $backup | Out-Null
+    if ($LASTEXITCODE -ne 0 -or !(Test-Path -LiteralPath $backup -PathType Leaf)) {
+        throw 'Could not save the BCD before clearing the native Setup boot.'
+    }
+    if ((Get-NativeSafeOsQueue) -ine $queued) { throw 'The queued native Setup loader changed before cleanup.' }
+    & $bcd /deletevalue '{bootmgr}' bootsequence | Out-Null
+    if ($LASTEXITCODE -ne 0 -or (Get-NativeSafeOsQueue -AllowMissing)) {
+        throw 'Could not clear the one-time native Setup boot.'
     }
 }
 
@@ -351,6 +384,7 @@ $retryPreparing = $Prepare -and $PSBoundParameters.ContainsKey('RetryPrepareJob'
 $protected = $false
 $reportWindowsStart = $false
 $bootArmed = $false
+$protectedRestartIssued = $false
 trap {
     if ($reportWindowsStart) {
         [IO.File]::WriteAllText((Join-Path $job 'windows-start-error.log'), $_.Exception.Message, [Text.UTF8Encoding]::new($false))
@@ -575,6 +609,7 @@ try {
         if ($protected) {
             Assert-WindowsReady
             if (Test-Path -LiteralPath $stagedSystem) { throw 'Windows Setup already has a staged installation.' }
+            if (Get-NativeSafeOsQueue -AllowMissing) { throw 'Windows Setup already has a queued SafeOS boot.' }
             $safeosHelper = Join-Path $job 'feature_safeos.ps1'
             $safeosWrapper = Join-Path $job 'feature_safeos.cmd'
             foreach ($path in $safeosHelper, $safeosWrapper) { Assert-PlainPath $path }
@@ -622,12 +657,12 @@ try {
                 throw 'The one-time recovery selection changed while preparing Setup.'
             }
             Assert-ProtectedRecoveryMedia $job $jobId $request
-            Assert-NativeSafeOsQueue
+            $null = Get-NativeSafeOsQueue
             $wim = Join-Path "$env:SystemDrive\" '$WINDOWS.~BT\Sources\SafeOS\winre.wim'
             $patchedHash = Install-WuoSafeOsImage $wim $job $safeosWrapper -FileCompare:$reportWindowsStart
             [IO.File]::WriteAllText((Join-Path $job 'safeos.sha256'), "$patchedHash`r`n", [Text.Encoding]::ASCII)
             Assert-ProtectedRecoveryMedia $job $jobId $request
-            Assert-NativeSafeOsQueue
+            $null = Get-NativeSafeOsQueue
             if ($reportWindowsStart) {
                 Assert-WuoUnchangedBootEntry $request.recovery.entry
                 Assert-WuoUnchangedBootEntry $request.recovery.entry.windows_entry
@@ -644,6 +679,7 @@ try {
             }
             & "$env:SystemRoot\System32\shutdown.exe" /r /t 0
             if ($LASTEXITCODE -ne 0) { throw 'Could not start the verified SafeOS reboot.' }
+            $protectedRestartIssued = $true
             if ($reportWindowsStart) {
                 [IO.File]::WriteAllText((Join-Path $job 'protected-reboot.id'), "$jobId`r`n", [Text.Encoding]::ASCII)
             }
@@ -686,13 +722,14 @@ try {
     if ($protected -and $finalizing) {
         $stageLog = Join-Path $job 'protected-stage.log'
         Add-Content -LiteralPath $stageLog -Encoding Utf8 -Value $failure.Exception.Message
-        if ($reportWindowsStart -and $bootArmed -and !(Test-Path -LiteralPath $stagedSystem) -and
-            !(Test-Path -LiteralPath (Join-Path "$env:SystemDrive\" '$WINDOWS.~BT\Sources\SafeOS\winre.wim'))) {
+        if ($reportWindowsStart -and $bootArmed -and !$protectedRestartIssued -and
+            !(Test-Path -LiteralPath (Join-Path $job 'safeos.ready'))) {
             try {
-                $windowsManager = & "$env:SystemRoot\System32\bcdedit.exe" /enum '{bootmgr}' /v
-                if ($LASTEXITCODE -ne 0 -or ($windowsManager -match '^\s*bootsequence\s+')) {
-                    throw 'Could not rule out a queued Windows Setup restart.'
+                Assert-SourceMachine
+                if (Get-Process -Name setup,setuphost,setupprep,setupplatform,windowsupdatebox -ErrorAction SilentlyContinue) {
+                    throw 'Windows Setup still has a running process. The recovery boot guard remains armed.'
                 }
+                Clear-AbortedNativeSetupBoot $job
                 Clear-AbortedProtectedBoot $request.recovery.entry
                 Complete-FeatureBoot $job $jobId $request 'failure'
             } catch {
